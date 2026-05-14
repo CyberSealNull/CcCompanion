@@ -2986,20 +2986,40 @@ class PushHandler(BaseHTTPRequestHandler):
         # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
         # 不存在 fallback 直接 tmux paste-buffer + send-keys 注入 (ccc 公开版默认走这条)
         target_session = (self.state.active_session or "opia").strip()
-        self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
+        ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
+        if not ok:
+            # 注入失败 (target session 不存在 / tmux 没装 / bus_send crash 等). 用 502 surface
+            # 给客户端 不再 silent 200 — 否则 ccc app 显示发送成功但 chain 根本收不到.
+            self._send_json(502, {
+                "ok": False,
+                "error": f"inject to tmux session '{target_session}' failed: {err}",
+                "record": rec,
+            })
+            return
         self._send_json(200, {"ok": True, "record": rec})
 
     def _inject_to_session(self, session: str, text: str, source: str = "ios-app", sender: str = "iphone"):
-        """Inject text into target tmux session.
+        """Inject text into target tmux session. Returns (success, error_msg).
 
         Prefer bus_send.py (Opia internal bus dispatcher routing for multi-agent coord)
-        if it exists at the configured path. Otherwise fall back to direct
-        tmux load-buffer + paste-buffer + send-keys, which is what ccc public
-        users get by default — no Opia internal daemon required.
+        if both the script exists AND /tmp/opia_bus.sock is reachable (dispatcher running).
+        Otherwise fall back to direct tmux load-buffer + paste-buffer + send-keys,
+        which is what ccc public users get by default — no Opia internal daemon required.
         """
         import os
+        import socket
         bus_path = self.state.bus_send_path
-        if bus_path and os.path.exists(bus_path):
+        bus_sock = "/tmp/opia_bus.sock"
+        bus_ready = False
+        if bus_path and os.path.exists(bus_path) and os.path.exists(bus_sock):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.2)
+                    s.connect(bus_sock)
+                bus_ready = True
+            except Exception:
+                bus_ready = False
+        if bus_ready:
             try:
                 subprocess.Popen(
                     [
@@ -3013,20 +3033,47 @@ class PushHandler(BaseHTTPRequestHandler):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                return
+                return True, ""
             except Exception as e:
                 logger.warning("bus_send fail, falling back to tmux: %s", e)
-        # Fallback: direct tmux paste-buffer + send-keys (ccc public default)
+        # Fallback: direct tmux paste-buffer + send-keys (ccc public default).
+        # 先 verify target session 存在 — 不然 paste-buffer/send-keys 会 silently 失败.
+        try:
+            has = subprocess.run(
+                ["tmux", "has-session", "-t", session],
+                capture_output=True, text=True, timeout=2,
+            )
+            if has.returncode != 0:
+                err = f"tmux session not found (run `tmux new-session -d -s {session} 'claude --dangerously-skip-permissions'`)"
+                logger.warning("tmux inject: %s", err)
+                return False, err
+        except FileNotFoundError:
+            return False, "tmux not installed (brew install tmux)"
+        except Exception as e:
+            return False, f"tmux has-session check failed: {e}"
         try:
             p = subprocess.Popen(
                 ["tmux", "load-buffer", "-"],
                 stdin=subprocess.PIPE,
             )
             p.communicate(input=text.encode("utf-8"))
-            subprocess.run(["tmux", "paste-buffer", "-t", session, "-p"], check=False)
-            subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=False)
+            paste = subprocess.run(
+                ["tmux", "paste-buffer", "-t", session, "-p"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if paste.returncode != 0:
+                return False, f"tmux paste-buffer failed: {paste.stderr.strip()}"
+            send = subprocess.run(
+                ["tmux", "send-keys", "-t", session, "Enter"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if send.returncode != 0:
+                return False, f"tmux send-keys failed: {send.stderr.strip()}"
+            return True, ""
         except Exception as e:
-            logger.warning("tmux inject fail (session=%s): %s", session, e)
+            err = f"tmux inject failed: {e}"
+            logger.warning("%s (session=%s)", err, session)
+            return False, err
 
     def _handle_pet_state_get(self):
         """GET /pet/state — 当前 latest 状态."""

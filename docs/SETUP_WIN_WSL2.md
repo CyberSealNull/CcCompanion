@@ -278,13 +278,13 @@ EOF
 ```bash
 tee ~/.config/systemd/user/cc-tmux.service > /dev/null <<'EOF'
 [Unit]
-Description=Persistent Claude Code tmux session (main)
+Description=Persistent Claude Code tmux session (opia)
 After=network-online.target
 
 [Service]
 Type=forking
-ExecStart=/usr/bin/tmux new-session -d -s main "claude --dangerously-skip-permissions"
-ExecStop=/usr/bin/tmux kill-session -t main
+ExecStart=/usr/bin/tmux new-session -d -s opia "claude --dangerously-skip-permissions"
+ExecStop=/usr/bin/tmux kill-session -t opia
 Restart=on-failure
 RestartSec=5
 
@@ -318,7 +318,7 @@ curl -s http://127.0.0.1:8795/health
 
 期望:
 - 两个 service 都 `active (running)`
-- `tmux list-sessions` 看到 `main:`
+- `tmux list-sessions` 看到 `opia:`
 - curl 返 `{"ok": true, ...}`
 
 看 log:
@@ -333,7 +333,7 @@ tail -f ~/CcCompanion/apns-server/push.log
 
 ```bash
 tmux new-session -d -s apns "~/CcCompanion/apns-server/.venv/bin/python ~/CcCompanion/apns-server/push.py"
-tmux new-session -d -s main "claude --dangerously-skip-permissions"
+tmux new-session -d -s opia "claude --dangerously-skip-permissions"
 tmux attach -t apns   # 看 server log
 ```
 
@@ -571,5 +571,5 @@ WSL2 装 Ubuntu 22.04 开 systemd → apt 装 build 工具 + Python + Node + tmu
 后续问题:
 - log: `~/CcCompanion/apns-server/push.log` 跟 `push.err.log`
 - 改 config 后重启 service: `systemctl --user restart apns-server.service`
-- 看 cc session: `tmux attach -t main`, Ctrl-b d 解 attach 不杀 session
+- 看 cc session: `tmux attach -t opia`, Ctrl-b d 解 attach 不杀 session
 - 改 portproxy 端口: 改第 7.2 节脚本里的 8795 跟 firewall rule 重跑
