@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- CcCompanion v0.1: APNs removed. App Group dedicated to cccompanion (separate from main Opia). -->
+	<!-- Requires group.starryfield.cccompanion to exist in Apple Developer Portal before fastlane archive. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.starryfield.cccompanion</string>
+	</array>
+</dict>
+</plist>

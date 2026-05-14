@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>CcCompanion</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>拍照发给 Opia</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>OTS 需要访问你本地网络上的 Claude Code server</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>OTS 把对话长图保存到相册</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
+	<key>UIAppFonts</key>
+	<array>
+		<string>SourceSerif4-Regular.otf</string>
+		<string>SourceSerif4-Semibold.otf</string>
+		<string>SourceHanSerifSC-Regular.otf</string>
+		<string>SourceHanSerifSC-Bold.otf</string>
+	</array>
+</dict>
+</plist>

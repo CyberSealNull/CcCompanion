@@ -1,0 +1,69 @@
+# --- macOS noise ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# --- Xcode build / derived ---
+build/
+DerivedData/
+*.xcuserdatad
+*.xcuserdata
+xcuserdata/
+*.xcarchive
+*.ipa
+*.dSYM/
+*.dSYM.zip
+
+# --- editor / tool backup files ---
+*.bak
+*.bak.*
+*.bak2
+*.swp
+*.swo
+
+# --- iOS app build outputs (we keep source only) ---
+/build/
+ios-app/build/
+ios-app/**/build/
+ios-app/**/DerivedData/
+
+# --- Python venv / cache / logs ---
+apns-server/.venv/
+apns-server/.pytest_cache/
+apns-server/__pycache__/
+apns-server/**/__pycache__/
+*.pyc
+*.pyo
+apns-server/.agents/
+apns-server/server.out
+apns-server/server.err.log
+apns-server/server.out.log
+apns-server/*.log
+
+# --- Secrets / runtime config (never commit) ---
+apns-server/config.toml
+apns-server/secrets/
+apns-server/tokens/
+apns-server/state/
+apns-server/static/
+apns-server/skills-lock.json
+
+# --- User chat / favorites / diary / group / timeline / pet data ---
+apns-server/*.jsonl
+apns-server/*.bak.*
+apns-server/tests/
+
+# --- Editor / IDE noise ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- AI-generated session noise ---
+.claude/
+.codex/
+
+# --- Doc archive (历史 spec / results / migration drafts) ---
+_archived/

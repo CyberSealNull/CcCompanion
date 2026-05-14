@@ -1,0 +1,55 @@
+# CcCompanion APNs server 配置模板
+# 实际部署 cp config.example.toml config.toml 然后填入真实值
+# config.toml 不入 git (已在 .gitignore)
+
+[apns]
+# Apple Developer 后台拿
+# .p8 文件下载到本机后路径绝对化
+p8_path = "~/Opia/apns-server/secrets/AuthKey_XXXXXXXXXX.p8"
+
+# Apple Developer 后台 -> Membership 看 Team ID (10 位字符)
+team_id = "XXXXXXXXXX"
+
+# .p8 文件名里的 10 位字符 / 也在 Apple Developer 后台 Keys 页能看
+key_id = "XXXXXXXXXX"
+
+# 主 app Bundle ID (跟 Xcode 项目 Bundle Identifier 一致)
+# 改成你自己的 bundle id 例 com.yourname.cccompanion
+bundle_id = "com.example.cccompanion"
+
+# 沙盒 vs 生产
+# Xcode debug build (run from Xcode) 走 sandbox = true
+# TestFlight / App Store build 走 sandbox = false
+# 真机测试常规走 sandbox 拿 device + Live Activity push token 时 token 是 sandbox-only
+sandbox = true
+
+[server]
+# 监听地址 默认 127.0.0.1 (内网 only)
+# 跨设备访问改 0.0.0.0 + 配 shared_secret 或者用 Tailscale / ZeroTier
+host = "127.0.0.1"
+port = 8795
+
+# token 持久化路径 (重启后 reload 不丢)
+token_store_path = "~/Opia/apns-server/tokens/active.json"
+
+# P0-3: 写接口鉴权 token. 留空则启动时自动生成并写 ~/.ots/secret (mode 0600)。
+# 自动生成的 secret 会 log 到控制台，复制到 OTS app onboarding wizard。
+# 手动填写可覆盖自动生成。不要 commit 真实密钥到 git。
+shared_secret = ""
+
+# P0-1: strict_auth=true 所有写接口必须带 X-Auth-Token 头。
+# 默认 true (secure-by-default)。调试时可改 false，上线前改回 true。
+strict_auth = true
+
+# P0-1: 允许绑定 0.0.0.0 (公网接口)。默认 false = 仅本机。
+# 如果改 true，请确保前置 HTTPS reverse proxy (Caddy/Nginx) + 防火墙已配置。
+allow_public_bind = false
+
+# P0-2: 开启远程控制端点 (/chain/abort /chain/restart /chat/regenerate /tmux/send /tmux/capture)。
+# 默认 false。只有在同机器跑 Claude Code 且理解风险时才改 true。
+# CcCompanion 阉割版用户不需要改此项。
+allow_remote_control = false
+
+# IP 访问白名单. 空列表=不限制.
+# 可选值例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"]
+allowed_ips = []
