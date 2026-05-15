@@ -23,6 +23,10 @@ bundle_id = "com.example.cccompanion"
 # 真机测试常规走 sandbox 拿 device + Live Activity push token 时 token 是 sandbox-only
 sandbox = true
 
+# 临时停用 Live Activity push。保留普通 APNs 通知。
+# 如果灵动岛耗电或调试时不想刷新 Live Activity，可改 true 后重启 server。
+live_activity_disabled = false
+
 [server]
 # 监听地址 默认 127.0.0.1 (内网 only)
 # 跨设备访问改 0.0.0.0 + 配 shared_secret 或者用 Tailscale / ZeroTier

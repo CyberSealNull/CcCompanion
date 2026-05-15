@@ -87,8 +87,11 @@ CcCompanion/
 ├── .gitignore                   ← what we keep out of git (secrets / logs / build / user data)
 ├── ios-app/                     ← SwiftUI iOS app (Xcode project)
 │   └── CcCompanion/           ← root Xcode workspace; build scheme `CcCompanion`
-├── apns-server/                 ← Python HTTP server (push.py is the entry point)
-│   ├── push.py                  ← main server
+├── apns-server/                 ← Python HTTP server
+│   ├── push.py                  ← compatibility entry point
+│   ├── main.py                  ← convenience entry point
+│   ├── server/                  ← HTTP handler, route modules, runtime state
+│   ├── scripts/doctor.py        ← local preflight checks
 │   ├── apns_client.py           ← Apple Push wrapper
 │   ├── chat_history.py          ← chat persistence
 │   ├── config.example.toml      ← config template — copy to config.toml and fill
@@ -103,7 +106,10 @@ The server is organized into self-contained `.py` modules. The headline ones:
 
 | Module             | What it does                                           |
 | ------------------ | ------------------------------------------------------ |
-| `push.py`          | HTTP server entry point, route handlers, APNs glue.   |
+| `push.py`          | Compatibility entry point for existing LaunchAgent setups. |
+| `server/main.py`   | Server startup, config loading, and HTTP runtime.     |
+| `server/handler.py` | Shared HTTP handler behavior: auth, JSON responses, dispatch. |
+| `server/routes_*.py` | Route handlers grouped by chat, chain, tmux, push, and miscellaneous endpoints. |
 | `apns_client.py`   | Apple Push HTTP/2 client with JWT auth.               |
 | `chat_history.py`  | Append-only message log + search index.               |
 | `token_store.py`   | Shared-secret store for write-endpoint auth.          |
@@ -112,7 +118,7 @@ The server is organized into self-contained `.py` modules. The headline ones:
 | `task_queue.py`    | Background work pool.                                 |
 | `usage.py`         | Anthropic usage probe (optional).                      |
 
-Other modules (`diary`, `favorites`, `group_chat`, `rp_history`, `studyroom`, `timeline`, `todos`, `worklog`, `reminders`, `calendar_store`, `pet_state`, `tts`, `settings`, `diary_stream`, `studyroom_indexer`) implement extra endpoints the CcCompanion iOS app does not call. They're kept in-tree because removing them would fragment the import graph in `push.py`. If you build your own iOS client against this server, those endpoints are available but undocumented; treat them as experimental.
+Other modules (`diary`, `favorites`, `group_chat`, `rp_history`, `studyroom`, `timeline`, `todos`, `worklog`, `reminders`, `calendar_store`, `pet_state`, `tts`, `settings`, `diary_stream`, `studyroom_indexer`) implement extra endpoints the CcCompanion iOS app does not call. They're kept in-tree because removing them would fragment the server import graph. If you build your own iOS client against this server, those endpoints are available but undocumented; treat them as experimental.
 
 ## Build the iOS app yourself
 
@@ -160,8 +166,9 @@ Issues and PRs welcome. Some areas where we'd love help:
 Before opening a PR, please:
 
 1. Run `xcodebuild -project ios-app/CcCompanion/CcCompanion.xcodeproj -scheme CcCompanion -configuration CcRelease -destination 'generic/platform=iOS' build` — must succeed.
-2. Run `python3 -m py_compile apns-server/*.py` — must produce no errors.
-3. Keep secrets / `.p8` / `config.toml` / `tokens/` / `*.jsonl` out of commits (`.gitignore` already covers these).
+2. Run `python3 -m py_compile apns-server/*.py apns-server/server/*.py apns-server/scripts/*.py` — must produce no errors.
+3. Run `cd apns-server && .venv/bin/python scripts/doctor.py` after installing server dependencies.
+4. Keep secrets / `.p8` / `config.toml` / `tokens/` / `*.jsonl` out of commits (`.gitignore` already covers these).
 
 ## License
 

@@ -11,6 +11,7 @@ Modules:
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import logging
@@ -24,7 +25,10 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    yaml = None
 
 logger = logging.getLogger("cc-apns-server.studyroom")
 
@@ -119,10 +123,48 @@ def parse_frontmatter(md_text: str) -> dict[str, Any]:
     if not m:
         return {}
     try:
-        data = yaml.safe_load(m.group(1)) or {}
+        if yaml is not None:
+            data = yaml.safe_load(m.group(1)) or {}
+        else:
+            data = _parse_simple_yaml(m.group(1))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _parse_simple_yaml(raw: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        out[key] = _parse_simple_value(value)
+    return out
+
+
+def _parse_simple_value(value: str) -> Any:
+    if value == "":
+        return None
+    if value in {"[]", "{}"}:
+        return [] if value == "[]" else {}
+    if value.startswith("[") and value.endswith("]"):
+        try:
+            return ast.literal_eval(value)
+        except Exception:
+            inner = value[1:-1].strip()
+            return [v.strip().strip("\"'") for v in inner.split(",") if v.strip()]
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    try:
+        return int(value)
+    except Exception:
+        pass
+    return value.strip("\"'")
 
 
 def _strip_frontmatter(md_text: str) -> str:

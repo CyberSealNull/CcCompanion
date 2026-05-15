@@ -61,11 +61,13 @@ class APNsClient:
         jwt_provider: APNsJWT,
         sandbox: bool = False,
         timeout: float = 10.0,
+        live_activity_disabled: bool = False,
     ):
         self.bundle_id = bundle_id
         self.jwt = jwt_provider
         self.base_url = APNS_SANDBOX if sandbox else APNS_PROD
         self.topic = f"{bundle_id}.push-type.liveactivity"
+        self.live_activity_disabled = live_activity_disabled
 
         self._client = httpx.Client(
             http2=True,
@@ -102,10 +104,8 @@ class APNsClient:
         force_alert: True 时把 alert_title / alert_body 写进 aps.alert 触发 banner + 锁屏
                      默认 False 仅 relevance-score 让灵动岛短暂 expand 不响
         """
-        # 2026-05-07 用户让灵动岛先下线 别删 耗电太大 / 设 LIVE_ACTIVITY_DISABLED=1 跳过 push
-        # 客户端没新 push Live Activity 走 stale 失活 想恢复 unset env 重启 push.py
-        import os as _os
-        if _os.environ.get("LIVE_ACTIVITY_DISABLED") == "1":
+        # 客户端没新 push Live Activity 走 stale 失活；恢复时把配置改回 false 并重启 server。
+        if self.live_activity_disabled:
             return APNsResponse(status=0, apns_id=None, body="live_activity_disabled")
         if event not in {"update", "end"}:
             raise ValueError(f"unsupported event: {event}")

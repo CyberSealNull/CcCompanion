@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 config.toml
+*.p8
 secrets/
 tokens/
 *.bak.*

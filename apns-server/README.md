@@ -74,6 +74,7 @@ cp config.example.toml config.toml
 #   shared_secret  写接口鉴权 (留空 server 自动生成并写 ~/.ots/secret)
 #   strict_auth    建议 true
 #   [apns] 段     如果你有 Apple Developer 账号填 p8/team_id/key_id/bundle_id; 没有就跳过, 走 Bark fallback
+#   live_activity_disabled  临时停用 Live Activity push 时改 true
 ```
 
 ### 3. Apple Developer p8 (可选, 不要 Bark 也行)
@@ -88,6 +89,14 @@ cp config.example.toml config.toml
 
 ```bash
 .venv/bin/python3 push.py --config config.toml
+```
+
+`push.py` 仍然是兼容入口；实际 server 实现在 `server/` 包里。也可以运行 `.venv/bin/python3 main.py --config config.toml`。
+
+**本地体检:**
+
+```bash
+.venv/bin/python3 scripts/doctor.py --config config.toml
 ```
 
 **后台 LaunchAgent (macOS):**
@@ -156,7 +165,19 @@ cd apns-server
 
 ```
 apns-server/
-├── push.py                # 主 server (HTTP listen + route)
+├── push.py                # 兼容入口 (旧 LaunchAgent / 文档命令继续可用)
+├── main.py                # 便捷入口
+├── server/
+│   ├── main.py            # 启动入口 + run_server
+│   ├── common.py          # ServerState + 共享 helper
+│   ├── handler.py         # PushHandler 基类 / route dispatch
+│   ├── routes_chat.py     # /chat/* + attachment
+│   ├── routes_chain.py    # /chain/* + session/status
+│   ├── routes_tmux.py     # /tmux/*
+│   ├── routes_push.py     # APNs register / push
+│   └── routes_misc.py     # diary/group/favorites 等私有端点
+├── scripts/
+│   └── doctor.py          # 本地体检脚本
 ├── apns_client.py         # APNs HTTP/2 client
 ├── jwt_helper.py          # JWT ES256 signer
 ├── token_store.py         # shared_secret 持久化
@@ -170,4 +191,4 @@ apns-server/
 └── tests/                 # 单元测试 (.gitignored)
 ```
 
-其它 `.py` 模块 (`diary`, `favorites`, `group_chat`, `rp_history`, `studyroom`, `timeline`, `todos`, `worklog`, `reminders`, `calendar_store`, `pet_state`, `tts`, `settings`, `diary_stream`, `studyroom_indexer`) 是给私有客户端用的 endpoint, CcCompanion iOS app 不调它们, 保留在 tree 里因为 `push.py` 引用了它们。
+其它 `.py` 模块 (`diary`, `favorites`, `group_chat`, `rp_history`, `studyroom`, `timeline`, `todos`, `worklog`, `reminders`, `calendar_store`, `pet_state`, `tts`, `settings`, `diary_stream`, `studyroom_indexer`) 是给私有客户端用的 endpoint, CcCompanion iOS app 不调它们, 保留在 tree 里是为了维持 server import graph 完整。

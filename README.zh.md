@@ -86,8 +86,11 @@ CcCompanion/
 ├── .gitignore                   ← 不入 git 的清单 (secrets / logs / build / 用户数据)
 ├── ios-app/                     ← SwiftUI iOS app (Xcode 工程)
 │   └── CcCompanion/           ← Xcode workspace 根; build scheme `CcCompanion`
-├── apns-server/                 ← Python HTTP 服务 (push.py 是入口)
-│   ├── push.py                  ← 主 server
+├── apns-server/                 ← Python HTTP 服务
+│   ├── push.py                  ← 兼容入口
+│   ├── main.py                  ← 便捷入口
+│   ├── server/                  ← HTTP handler、路由模块、运行时状态
+│   ├── scripts/doctor.py        ← 本地体检脚本
 │   ├── apns_client.py           ← Apple Push 封装
 │   ├── chat_history.py          ← chat 持久化
 │   ├── config.example.toml      ← 配置模板, copy 到 config.toml 改填
@@ -102,7 +105,10 @@ server 拆成几个独立 `.py`。主要的:
 
 | 模块                | 干啥                                            |
 | ------------------ | ----------------------------------------------- |
-| `push.py`          | HTTP server 入口, 路由 handler, APNs 调度。      |
+| `push.py`          | 兼容入口，保留给已有 LaunchAgent 和旧文档命令。  |
+| `server/main.py`   | server 启动、配置加载和 HTTP runtime。           |
+| `server/handler.py` | 通用 HTTP handler：鉴权、JSON 响应和路由分发。  |
+| `server/routes_*.py` | 按 chat、chain、tmux、push、misc 分组的端点实现。 |
 | `apns_client.py`   | Apple Push HTTP/2 客户端加 JWT 鉴权。            |
 | `chat_history.py`  | 消息日志 append-only + 搜索索引。                |
 | `token_store.py`   | 写接口鉴权 shared-secret 存储。                   |
@@ -111,7 +117,7 @@ server 拆成几个独立 `.py`。主要的:
 | `task_queue.py`    | 后台任务池。                                     |
 | `usage.py`         | Anthropic 用量探针 (可选)。                       |
 
-其它模块 (`diary`, `favorites`, `group_chat`, `rp_history`, `studyroom`, `timeline`, `todos`, `worklog`, `reminders`, `calendar_store`, `pet_state`, `tts`, `settings`, `diary_stream`, `studyroom_indexer`) 是给私有客户端用的 endpoint, CcCompanion iOS app 不调它们。留在仓库里因为 `push.py` 引用了它们, 删模块会让 import graph 散架。你想拿这套 server 接你自己的客户端那些 endpoint 也能用, 但没文档支持, 当实验性看。
+其它模块 (`diary`, `favorites`, `group_chat`, `rp_history`, `studyroom`, `timeline`, `todos`, `worklog`, `reminders`, `calendar_store`, `pet_state`, `tts`, `settings`, `diary_stream`, `studyroom_indexer`) 是给私有客户端用的 endpoint, CcCompanion iOS app 不调它们。留在仓库里是因为删除它们会让 server import graph 散架。你想拿这套 server 接你自己的客户端那些 endpoint 也能用, 但没文档支持, 当实验性看。
 
 ## 自己 build iOS app
 
@@ -159,8 +165,9 @@ issue + PR 都欢迎。我们特别想要的:
 提 PR 之前请:
 
 1. 跑 `xcodebuild -project ios-app/CcCompanion/CcCompanion.xcodeproj -scheme CcCompanion -configuration CcRelease -destination 'generic/platform=iOS' build` 必须 SUCCEEDED。
-2. 跑 `python3 -m py_compile apns-server/*.py` 不能报错。
-3. secrets / `.p8` / `config.toml` / `tokens/` / `*.jsonl` 不能进 commit (`.gitignore` 已经挡了)。
+2. 跑 `python3 -m py_compile apns-server/*.py apns-server/server/*.py apns-server/scripts/*.py` 不能报错。
+3. 安装服务端依赖后跑 `cd apns-server && .venv/bin/python scripts/doctor.py`。
+4. secrets / `.p8` / `config.toml` / `tokens/` / `*.jsonl` 不能进 commit (`.gitignore` 已经挡了)。
 
 ## License
 

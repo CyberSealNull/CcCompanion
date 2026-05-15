@@ -48,6 +48,7 @@ apns-server/*.log
 
 # --- Secrets / runtime config (never commit) ---
 apns-server/config.toml
+*.p8
 apns-server/secrets/
 apns-server/tokens/
 apns-server/state/
