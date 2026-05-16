@@ -562,7 +562,7 @@ sed -i '' "s|__APNS_DIR__|$HOME/Cc/apns-server|g" ~/Library/LaunchAgents/com.use
 > tmux send-keys -t opia "claude --dangerously-skip-permissions" Enter
 > ```
 
-`opia` 是 session 名 (sid), 这是 ccc 默认连的 sid。后续 `/switch <sid>` 切别的 session 时用得上。
+`opia` 是 session 名 (sid), 这是 ccc 默认连的 sid。后续 `/switch <sid>` 切别的 session 时用得上。如果想用自己的 session 名, 在 `config.toml` 的 `[server]` 段加一行 `default_session = "你的 session 名"`, 把上面命令里的 `opia` 改成一样的名字。
 
 `--dangerously-skip-permissions` 让 claude 不弹"是否允许工具调用"的确认, 适合无人值守, **代价是 claude 任何工具调用都直接放行**。如果用户对此敏感, 改成 `claude` 不带 flag, 但这样会偶尔卡在确认弹窗等输入。
 

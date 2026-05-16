@@ -291,6 +291,7 @@ class ServerState:
         self.allow_public_bind: bool = bool(server_cfg.get("allow_public_bind", False))
         self.allow_remote_control: bool = bool(server_cfg.get("allow_remote_control", False))
         self.allowed_ips: list[str] = list(server_cfg.get("allowed_ips", []) or [])
+        self.default_session: str = server_cfg.get("default_session", "opia")
 
         if self.apns_enabled:
             self.jwt = APNsJWT(
@@ -372,11 +373,11 @@ class ServerState:
         # 当前活跃 chain session (slash /switch 持久化)
         active_session_path = Path(self.token_store_path).expanduser().parent / "active_session.json"
         self.active_session_path = active_session_path
-        self.active_session: str = "opia"  # default
+        self.active_session: str = self.default_session  # default
         if active_session_path.exists():
             try:
                 _as = json.loads(active_session_path.read_text())
-                self.active_session = _as.get("active_sid", "opia")
+                self.active_session = _as.get("active_sid", self.default_session)
             except Exception:
                 pass
         self.diary = Diary(Path("~/Documents/星原/眠的小家/日记/").expanduser())
@@ -2763,7 +2764,7 @@ class PushHandler(BaseHTTPRequestHandler):
         陌生的新 claude 不知道 UX 不友好. 改成"创了但不切" 用户想切过去再 /switch <sid> 显式."""
         import time as _t
         counter = _t.strftime("%H%M%S")
-        new_sid = f"opia-{counter}"
+        new_sid = f"{self.state.default_session}-{counter}"
         try:
             subprocess.run(["tmux", "new-session", "-d", "-s", new_sid], check=True, timeout=10)
             _t.sleep(0.5)
@@ -3030,7 +3031,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # 2026-05-14 build 200 — 不依赖 ~/scripts/bus_send.py (Opia 内部 file, ccc 公开版用户没有)
         # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
         # 不存在 fallback 直接 tmux paste-buffer + send-keys 注入 (ccc 公开版默认走这条)
-        target_session = (self.state.active_session or "opia").strip()
+        target_session = (self.state.active_session or self.state.default_session).strip()
         ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
         if not ok:
             # 注入失败 (target session 不存在 / tmux 没装 / bus_send crash 等). 用 502 surface
@@ -3320,17 +3321,18 @@ class PushHandler(BaseHTTPRequestHandler):
             logger.info("chat/regenerate extra_marked=%d ids=%s", extra_marked, extra_replace_ids)
 
         # 中断 chain (tmux Escape x 3 复用 chain_abort 逻辑)
+        _regen_session = self.state.active_session or self.state.default_session
         try:
             import subprocess
             import time as _t
             for i in range(3):
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", "opia", "Escape"],
+                    ["tmux", "send-keys", "-t", _regen_session, "Escape"],
                     capture_output=True, text=True, timeout=5,
                 )
                 if i < 2:
                     _t.sleep(0.2)
-            logger.info("chat/regenerate sent 3x Escape to opia tmux")
+            logger.info("chat/regenerate sent 3x Escape to %s tmux", _regen_session)
         except Exception as e:
             logger.warning("chat/regenerate tmux abort fail: %s", e)
 
@@ -3354,7 +3356,7 @@ class PushHandler(BaseHTTPRequestHandler):
 
         # 注入 regenerate 文本到 active session — 走 _inject_to_session helper
         # ccc 公开用户没 ~/scripts/bus_send.py 时 fallback 直接 tmux 注入
-        target_session = (self.state.active_session or "opia").strip()
+        target_session = (self.state.active_session or self.state.default_session).strip()
         ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
         if not ok:
             self._send_json(502, {
@@ -3699,7 +3701,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 hint = f"[引用 \"{rec['quoted_text']}\"]\n" + hint
             # 给主 session 一条 hint 让 chain 读 file (mac mini 内可读 stored_path)
             hint += f"\n本地路径: {stored_path}"
-            target_session = (self.state.active_session or "opia").strip()
+            target_session = (self.state.active_session or self.state.default_session).strip()
             ok, err = self._inject_to_session(target_session, hint, source="ios-app", sender="iphone")
             if not ok:
                 # 附件已存盘 + 历史已 append 但 chain 注入失败 — 502 surface
@@ -4049,7 +4051,7 @@ class PushHandler(BaseHTTPRequestHandler):
     def _handle_tmux_capture(self):
         from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(self.path).query)
-        session = qs.get("session", ["opia"])[0]
+        session = qs.get("session", [self.state.default_session])[0]
         try:
             lines = int(qs.get("lines", ["120"])[0])
         except Exception:
@@ -4074,7 +4076,7 @@ class PushHandler(BaseHTTPRequestHandler):
         keys = body.get("keys", "")
         # 兜底 body 没传 session 时走当前 active_session 而不是写死 opia
         # (build 199 fix: /switch 后 iOS 没传 session 字段也能 follow active)
-        session = body.get("session") or self.state.active_session or "opia"
+        session = body.get("session") or self.state.active_session or self.state.default_session
         enter = bool(body.get("enter", True))
         if not keys and not enter:
             self._send_json(400, {"error": "keys or enter required"})
