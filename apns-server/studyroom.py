@@ -24,7 +24,10 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore[assignment]
 
 logger = logging.getLogger("cc-apns-server.studyroom")
 
@@ -113,6 +116,8 @@ _FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 def parse_frontmatter(md_text: str) -> dict[str, Any]:
     """Extract YAML frontmatter dict from md. Returns {} if absent / malformed."""
+    if yaml is None:
+        return {}
     if not md_text:
         return {}
     m = _FM_RE.match(md_text)
