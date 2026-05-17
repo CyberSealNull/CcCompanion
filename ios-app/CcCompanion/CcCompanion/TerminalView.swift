@@ -15,7 +15,7 @@ import Combine
 final class TerminalViewModel: ObservableObject {
     @Published var content: String = ""
     @Published var draft: String = ""
-    @Published var session: String = "cc"
+    @Published var session: String = ""
     @Published var sessions: [String] = []
     @Published var sending: Bool = false
     @Published var lastError: String? = nil
@@ -30,7 +30,10 @@ final class TerminalViewModel: ObservableObject {
 
     func start() {
         pollingTask?.cancel()
-        Task { await self.fetchSessions() }
+        Task {
+            await self.fetchSessions()
+            await self.fetchCapture()
+        }
         pollingTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.fetchCapture()
@@ -51,13 +54,19 @@ final class TerminalViewModel: ObservableObject {
             if let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let arr = obj["sessions"] as? [String] {
                 self.sessions = arr
+                await reconcileSelectedSession(with: arr)
             }
         } catch {
             // 静默
+            if session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                session = await CcServerConfig.fetchDefaultSession(using: urlSession)
+            }
         }
     }
 
     func fetchCapture() async {
+        await ensureSessionSelected()
+        guard !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let base = CcServerConfig.serverURL.appendingPathComponent("tmux/capture")
         var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
         components?.queryItems = [
@@ -80,11 +89,32 @@ final class TerminalViewModel: ObservableObject {
         }
     }
 
+    private func ensureSessionSelected() async {
+        if !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
+        await fetchSessions()
+        if session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            session = await CcServerConfig.fetchDefaultSession(using: urlSession)
+        }
+    }
+
+    private func reconcileSelectedSession(with arr: [String]) async {
+        let current = session.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let first = arr.first, (current.isEmpty || !arr.contains(current)) {
+            session = first
+            return
+        }
+        if arr.isEmpty {
+            session = await CcServerConfig.fetchDefaultSession(using: urlSession)
+        }
+    }
+
     func send(enter: Bool = true) async {
         let keys = draft
         guard !keys.isEmpty || !enter else { return }
         sending = true
         defer { sending = false }
+        await ensureSessionSelected()
+        guard !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
         let url = CcServerConfig.serverURL.appendingPathComponent("tmux/send")
         var req = URLRequest(url: url)
@@ -119,6 +149,8 @@ final class TerminalViewModel: ObservableObject {
 
     // 2026-05-14 build 197 — 清屏 输 "clear" + Enter (走 shell clear)
     func sendClearScreen() async {
+        await ensureSessionSelected()
+        guard !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let url = CcServerConfig.serverURL.appendingPathComponent("tmux/send")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -138,6 +170,8 @@ final class TerminalViewModel: ObservableObject {
     }
 
     private func sendRawKey(_ keys: String) async {
+        await ensureSessionSelected()
+        guard !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let url = CcServerConfig.serverURL.appendingPathComponent("tmux/send")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -175,7 +209,7 @@ struct TerminalView: View {
                             .foregroundStyle(s == vm.session ? Color.white : Color.ccTextDim)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 3)
-                            .background(s == vm.session ? Color.ccAssistant : Color.clear)
+                            .background(s == vm.session ? Color.ccAccent : Color.clear)
                             .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                     }
                 }
@@ -235,7 +269,7 @@ struct TerminalView: View {
             HStack(spacing: 8) {
                 Text("$")
                     .font(.system(size: 14, design: .monospaced).weight(.bold))
-                    .foregroundStyle(Color.ccAssistant)
+                    .foregroundStyle(Color.ccAccent)
 
                 TextField("", text: $vm.draft, prompt: Text("命令").foregroundStyle(Color.ccTextDim), axis: .vertical)
                     .lineLimit(1...4)
@@ -261,7 +295,7 @@ struct TerminalView: View {
                 } label: {
                     Image(systemName: vm.sending ? "ellipsis.circle" : "return")
                         .font(.ccSerifAdaptive(size: 20, weight: .semibold))
-                        .foregroundStyle(vm.draft.isEmpty && !vm.sending ? Color.white.opacity(0.25) : Color.ccAssistant)
+                        .foregroundStyle(vm.draft.isEmpty && !vm.sending ? Color.white.opacity(0.25) : Color.ccAccent)
                 }
                 .disabled(vm.sending)
             }

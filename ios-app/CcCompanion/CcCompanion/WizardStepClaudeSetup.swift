@@ -15,7 +15,7 @@ struct WizardStepClaudeSetup: View {
     @State private var copiedToast: Bool = false
 
     private static let claudeSetupPrompt = """
-请帮我装 OTS 开源 server。从 github.com/cc/ots-server git clone 到 ~/Cc/ots-server，pip install 依赖，启动 8795 端口（如果占用就换 8796），打印 server 内网 URL（http://你的内网 IP:8795）和自动生成的 auth token，告诉我我要在 CcCompanion wizard 里输入这两个。
+请帮我装 CcCompanion 开源 server。从 github.com/CyberSealNull/CcCompanion git clone 到 ~/CcCompanion，cd 进 apns-server 目录，pip install -r requirements.txt，启动 push.py 监听 8795 端口（如果占用就换 8796），打印 server 内网 URL（http://你的内网 IP:8795）和自动生成的 shared_secret，告诉我我要在 CcCompanion wizard 里输入这两个。
 """
 
     var body: some View {
@@ -27,7 +27,7 @@ struct WizardStepClaudeSetup: View {
                 .foregroundStyle(Color.ccText)
                 .padding(.bottom, 6)
 
-            Text("你需要在你的 macOS / Windows / Linux / 云服务器 上跑一份 OTS server，让 iPhone 可以连上。把下面这段话复制给你 mac 上的 Claude Code 终端，Claude 会自动帮你装好。")
+            Text("你需要在你的 macOS / Windows / Linux / 云服务器 上跑一份 CcCompanion server，让 iPhone 可以连上。把下面这段话复制给你 mac 上的 Claude Code 终端，Claude 会自动帮你装好。")
                 .font(.ccSerifAdaptive(size: 13))
                 .foregroundStyle(Color.ccTextDim)
                 .multilineTextAlignment(.leading)

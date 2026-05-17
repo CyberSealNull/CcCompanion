@@ -11,7 +11,6 @@ Modules:
 """
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import logging
@@ -26,9 +25,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 try:
-    import yaml  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    yaml = None
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore[assignment]
 
 logger = logging.getLogger("cc-apns-server.studyroom")
 
@@ -117,54 +116,18 @@ _FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 def parse_frontmatter(md_text: str) -> dict[str, Any]:
     """Extract YAML frontmatter dict from md. Returns {} if absent / malformed."""
+    if yaml is None:
+        return {}
     if not md_text:
         return {}
     m = _FM_RE.match(md_text)
     if not m:
         return {}
     try:
-        if yaml is not None:
-            data = yaml.safe_load(m.group(1)) or {}
-        else:
-            data = _parse_simple_yaml(m.group(1))
+        data = yaml.safe_load(m.group(1)) or {}
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
-
-
-def _parse_simple_yaml(raw: str) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key:
-            continue
-        out[key] = _parse_simple_value(value)
-    return out
-
-
-def _parse_simple_value(value: str) -> Any:
-    if value == "":
-        return None
-    if value in {"[]", "{}"}:
-        return [] if value == "[]" else {}
-    if value.startswith("[") and value.endswith("]"):
-        try:
-            return ast.literal_eval(value)
-        except Exception:
-            inner = value[1:-1].strip()
-            return [v.strip().strip("\"'") for v in inner.split(",") if v.strip()]
-    if value.lower() in {"true", "false"}:
-        return value.lower() == "true"
-    try:
-        return int(value)
-    except Exception:
-        pass
-    return value.strip("\"'")
 
 
 def _strip_frontmatter(md_text: str) -> str:

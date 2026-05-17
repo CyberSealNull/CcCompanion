@@ -200,6 +200,8 @@ class MiscRoutesMixin:
             cs["taskTotal"] = 0
             cs["taskStep"] = ""
             cs["taskProgress"] = 0.0
+        if not self.state.apns_enabled:
+            return
         active_tokens = self.state.tokens.all_active()
         if not active_tokens:
             return
@@ -748,6 +750,7 @@ class MiscRoutesMixin:
                     "--text", text,
                 ],
                 context="rp bus_send",
+                timeout=10.0,
             )
             self._send_json(200, {"ok": True, "record": rec})
         except Exception as e:
@@ -1018,6 +1021,7 @@ class MiscRoutesMixin:
                         "--inject-only",
                     ],
                     context="group bus_send",
+                    timeout=10.0,
                 )
             except Exception as e:
                 logger.warning("group bus_send fail: %s", e)
@@ -1104,6 +1108,7 @@ class MiscRoutesMixin:
                         "--inject-only",
                     ],
                     context="group fan-out",
+                    timeout=10.0,
                 )
             except Exception as e:
                 logger.warning("group fan-out fail: %s", e)
@@ -1526,6 +1531,7 @@ class MiscRoutesMixin:
                     "--mode", "user",
                 ],
                 context="todo notify_chain",
+                timeout=10.0,
             )
         except Exception as e:
             logger.warning("notify_chain_todo fail: %s", e)

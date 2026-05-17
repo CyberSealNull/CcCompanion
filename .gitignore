@@ -54,6 +54,7 @@ apns-server/tokens/
 apns-server/state/
 apns-server/static/
 apns-server/skills-lock.json
+*.p8
 
 # --- User chat / favorites / diary / group / timeline / pet data ---
 apns-server/*.jsonl

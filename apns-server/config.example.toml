@@ -57,3 +57,7 @@ allow_remote_control = false
 # IP 访问白名单. 空列表=不限制.
 # 可选值例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"]
 allowed_ips = []
+
+# default_session sets the tmux session name CcCompanion connects to.
+# Change this to match your own tmux session name.
+# default_session = "cc"

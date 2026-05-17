@@ -53,6 +53,8 @@ class PushRoutesMixin:
 
     def _send_chat_notification(self, title: str, body_text: str):
         """向所有已注册设备发 standard APNs banner 通知 (non-Live-Activity)."""
+        if not self.state.apns_enabled:
+            return
         device_tokens = self.state.device_tokens.all_tokens()
         if not device_tokens:
             return
@@ -129,6 +131,9 @@ class PushRoutesMixin:
             cs["taskProgress"] = current / total
             if active_task.get("step"):
                 cs["taskStep"] = str(active_task["step"])[:80]
+        if not self.state.apns_enabled:
+            self._send_json(200, {"ok": True, "sent": 0, "skipped": True, "note": "APNs not configured"})
+            return
         sent = 0
         for tok in active_tokens:
             try:
@@ -144,6 +149,9 @@ class PushRoutesMixin:
         event = body.get("event", "update")
         if event not in {"update", "end"}:
             self._send_json(400, {"error": f"unsupported event: {event}"})
+            return
+        if not self.state.apns_enabled:
+            self._send_json(200, {"ok": True, "delivered": 0, "skipped": True, "note": "APNs not configured"})
             return
 
         content_state = _state_to_payload(body)
@@ -271,4 +279,3 @@ class PushRoutesMixin:
                 "results": results,
             },
         )
-

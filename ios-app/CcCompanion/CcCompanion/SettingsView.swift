@@ -152,7 +152,7 @@ struct UsageSection: View {
                                 .foregroundStyle(Color.ccTextDim)
                             Text("$\(String(format: "%.2f", blk.costUsd))")
                                 .font(.ccSerifAdaptive(size: 20, weight: .semibold))
-                                .foregroundStyle(Color.ccAssistant)
+                                .foregroundStyle(Color.ccAccent)
                         }
                         if let mins = blk.minutesUntilReset {
                             Text("重置倒计时 \(mins) 分钟")

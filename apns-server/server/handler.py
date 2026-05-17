@@ -340,6 +340,7 @@ class PushHandler(
                     "active_tokens": len(self.state.tokens.all_active()),
                     "sandbox": self.state.sandbox,
                     "bundle_id": self.state.bundle_id,
+                    "apns_enabled": self.state.apns_enabled,
                 },
             )
             return
@@ -347,7 +348,15 @@ class PushHandler(
             self._send_json(200, {"ok": True, "version": self.server_version})
             return
         if self.path == "/web/chat" or self.path.startswith("/web/chat?"):
-            self._serve_web_chat()
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            query_token = qs.get("token", [None])[0]
+            if query_token and self.state.shared_secret and query_token == self.state.shared_secret:
+                self._serve_web_chat(auth_token=query_token)
+            elif not self.state.strict_auth or self._auth_matches():
+                self._serve_web_chat(auth_token=None)
+            else:
+                self._send_json(401, {"error": "unauthorized — use /web/chat?token=YOUR_SECRET"})
             return
         if self.path == "/gomoku/state":
             self._handle_gomoku_state()
@@ -604,4 +613,3 @@ class PushHandler(
             return
         else:
             self._send_json(404, {"error": "not found"})
-

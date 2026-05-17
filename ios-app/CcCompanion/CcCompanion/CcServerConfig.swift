@@ -15,6 +15,7 @@ nonisolated public enum CcServerConfig {
     private static let keychainAccount = "ccc-shared-secret"
 
     private static let placeholderURL = URL(string: "http://example.com:8795")!
+    public static let fallbackSession = "opia"
 
     public static var endpoints: [(url: String, label: String)] {
         guard let defaults = UserDefaults(suiteName: appGroup) else { return [] }
@@ -86,6 +87,21 @@ nonisolated public enum CcServerConfig {
             request.setValue(secret, forHTTPHeaderField: "X-Auth-Token")
         }
         return request
+    }
+
+    public static func fetchDefaultSession(using session: URLSession = .shared) async -> String {
+        let url = serverURL.appendingPathComponent("health")
+        do {
+            let (data, _) = try await session.data(for: authenticatedRequest(url: url))
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let sid = obj["default_session"] as? String {
+                let trimmed = sid.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+        } catch {
+            // Older servers may not expose default_session. Use the public fallback.
+        }
+        return fallbackSession
     }
 
     @discardableResult

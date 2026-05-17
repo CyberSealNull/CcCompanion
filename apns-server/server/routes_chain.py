@@ -107,7 +107,7 @@ class ChainRoutesMixin:
         陌生的新 claude 不知道 UX 不友好. 改成"创了但不切" 用户想切过去再 /switch <sid> 显式."""
         import time as _t
         counter = _t.strftime("%H%M%S")
-        new_sid = f"opia-{counter}"
+        new_sid = f"{self.state.default_session}-{counter}"
         try:
             subprocess.run(["tmux", "new-session", "-d", "-s", new_sid], check=True, timeout=10)
             _t.sleep(0.5)
@@ -330,4 +330,3 @@ class ChainRoutesMixin:
             self._send_json(200, {"ok": True, "lines": [l.rstrip("\n") for l in lines]})
         except Exception as e:
             self._send_json(500, {"ok": False, "error": str(e)})
-

@@ -19,7 +19,7 @@ class TmuxRoutesMixin:
     def _handle_tmux_capture(self):
         from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(self.path).query)
-        session = qs.get("session", ["opia"])[0]
+        session = qs.get("session", [self.state.default_session])[0]
         try:
             lines = int(qs.get("lines", ["120"])[0])
         except Exception:
@@ -44,7 +44,7 @@ class TmuxRoutesMixin:
         keys = body.get("keys", "")
         # 兜底 body 没传 session 时走当前 active_session 而不是写死 opia
         # (build 199 fix: /switch 后 iOS 没传 session 字段也能 follow active)
-        session = body.get("session") or self.state.active_session or "opia"
+        session = body.get("session") or self.state.active_session or self.state.default_session
         enter = bool(body.get("enter", True))
         if not keys and not enter:
             self._send_json(400, {"error": "keys or enter required"})

@@ -35,6 +35,7 @@ CcCompanion 两块:
 - iPhone iOS 18+。
 - Tailscale / ZeroTier / 或者 iPhone 跟 Mac 一个 LAN 段就行。
 - 想走原生 APNs 推送需要 Apple Developer 账号 ($99/年), 不想买就走 [Bark](https://github.com/Finb/Bark), 一样能收 push 通知。
+- **Xcode 16.3 或更新** (Swift tools 6.1+) 自行 build iOS app 时需要。GRDB 7.10.0 要求 Swift tools 6.1；旧版 Xcode (≤ 16.2) resolve 可能失败。TestFlight 安装不受此限制。
 
 ## 快速开始
 

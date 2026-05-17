@@ -128,14 +128,28 @@ class ChatRoutesMixin:
             logger.exception("chat poll fail")
             self._send_json(500, {"error": str(e)})
 
-    def _serve_web_chat(self):
-        html = WEB_CHAT_HTML.encode("utf-8")
+    def _serve_web_chat(self, auth_token=None):
+        html = WEB_CHAT_HTML
+        if auth_token:
+            inject = f"  const AUTH_TOKEN = {json.dumps(auth_token)};\n  history.replaceState({{}}, '', '/web/chat');\n"
+        else:
+            inject = "  const AUTH_TOKEN = '';\n"
+        html = html.replace("<script>\n", "<script>\n" + inject, 1)
+        html = html.replace(
+            "const res = await fetch(url, { cache: 'no-store' });",
+            "const res = await fetch(url, { cache: 'no-store', headers: AUTH_TOKEN ? {'X-Auth-Token': AUTH_TOKEN} : {} });",
+        )
+        html = html.replace(
+            "headers: { 'Content-Type': 'application/json' },",
+            "headers: { 'Content-Type': 'application/json', ...(AUTH_TOKEN ? {'X-Auth-Token': AUTH_TOKEN} : {}) },",
+        )
+        data = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(html)))
+        self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(html)
+        self.wfile.write(data)
 
     def _handle_chat_history(self):
         from urllib.parse import urlparse, parse_qs
@@ -224,7 +238,7 @@ class ChatRoutesMixin:
         # 2026-05-14 build 200 — 不依赖 ~/scripts/bus_send.py (Opia 内部 file, ccc 公开版用户没有)
         # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
         # 不存在 fallback 直接 tmux paste-buffer + send-keys 注入 (ccc 公开版默认走这条)
-        target_session = (self.state.active_session or "opia").strip()
+        target_session = (self.state.active_session or self.state.default_session).strip()
         ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
         if not ok:
             # 注入失败 (target session 不存在 / tmux 没装 / bus_send crash 等). 用 502 surface
@@ -270,6 +284,7 @@ class ChatRoutesMixin:
                         "--target", session,
                     ],
                     context="chat bus_send",
+                    timeout=10.0,
                 )
                 return True, ""
             except Exception as e:
@@ -362,17 +377,18 @@ class ChatRoutesMixin:
             logger.info("chat/regenerate extra_marked=%d ids=%s", extra_marked, extra_replace_ids)
 
         # 中断 chain (tmux Escape x 3 复用 chain_abort 逻辑)
+        regen_session = self.state.active_session or self.state.default_session
         try:
             import subprocess
             import time as _t
             for i in range(3):
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", "opia", "Escape"],
+                    ["tmux", "send-keys", "-t", regen_session, "Escape"],
                     capture_output=True, text=True, timeout=5,
                 )
                 if i < 2:
                     _t.sleep(0.2)
-            logger.info("chat/regenerate sent 3x Escape to opia tmux")
+            logger.info("chat/regenerate sent 3x Escape to %s tmux", regen_session)
         except Exception as e:
             logger.warning("chat/regenerate tmux abort fail: %s", e)
 
@@ -396,7 +412,7 @@ class ChatRoutesMixin:
 
         # 注入 regenerate 文本到 active session — 走 _inject_to_session helper
         # ccc 公开用户没 ~/scripts/bus_send.py 时 fallback 直接 tmux 注入
-        target_session = (self.state.active_session or "opia").strip()
+        target_session = (self.state.active_session or self.state.default_session).strip()
         ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
         if not ok:
             self._send_json(502, {
@@ -593,7 +609,7 @@ class ChatRoutesMixin:
 
         def _async_side_effects():
             try:
-                if active_tokens_snapshot:
+                if active_tokens_snapshot and self.state.apns_enabled:
                     cs: dict[str, Any] = {
                         "status": "spoke",
                         "lastMessagePreview": push_text_snap[:200],
@@ -741,7 +757,7 @@ class ChatRoutesMixin:
                 hint = f"[引用 \"{rec['quoted_text']}\"]\n" + hint
             # 给主 session 一条 hint 让 chain 读 file (mac mini 内可读 stored_path)
             hint += f"\n本地路径: {stored_path}"
-            target_session = (self.state.active_session or "opia").strip()
+            target_session = (self.state.active_session or self.state.default_session).strip()
             ok, err = self._inject_to_session(target_session, hint, source="ios-app", sender="iphone")
             if not ok:
                 # 附件已存盘 + 历史已 append 但 chain 注入失败 — 502 surface

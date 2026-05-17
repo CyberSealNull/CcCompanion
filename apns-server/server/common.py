@@ -89,7 +89,7 @@ def spawn_logged(
     args: Sequence[str],
     *,
     context: str,
-    timeout: float = 10.0,
+    timeout: float | None = None,
 ) -> subprocess.Popen[str]:
     """Start a background subprocess and log stderr, non-zero exits, and timeouts."""
     try:
@@ -307,16 +307,25 @@ WEB_CHAT_HTML = r"""<!DOCTYPE html>
 
 class ServerState:
     def __init__(self, config: dict[str, Any], sandbox_override: bool | None = None):
-        apns_cfg = config["apns"]
-        self.bundle_id: str = apns_cfg["bundle_id"]
-        self.team_id: str = apns_cfg["team_id"]
-        self.key_id: str = apns_cfg["key_id"]
-        self.p8_path: str = apns_cfg["p8_path"]
-        self.sandbox: bool = (
-            sandbox_override
-            if sandbox_override is not None
-            else apns_cfg.get("sandbox", True)
-        )
+        apns_cfg = config.get("apns", {})
+        _apns_required = ("p8_path", "team_id", "key_id", "bundle_id")
+        self.apns_enabled: bool = all(apns_cfg.get(k) for k in _apns_required)
+        if self.apns_enabled:
+            self.bundle_id: str = apns_cfg["bundle_id"]
+            self.team_id: str = apns_cfg["team_id"]
+            self.key_id: str = apns_cfg["key_id"]
+            self.p8_path: str = apns_cfg["p8_path"]
+            self.sandbox: bool = (
+                sandbox_override
+                if sandbox_override is not None
+                else apns_cfg.get("sandbox", True)
+            )
+        else:
+            self.bundle_id = ""
+            self.team_id = ""
+            self.key_id = ""
+            self.p8_path = ""
+            self.sandbox = False
         self.live_activity_disabled: bool = bool(
             apns_cfg.get(
                 "live_activity_disabled",
@@ -340,42 +349,50 @@ class ServerState:
         self.allow_public_bind: bool = bool(server_cfg.get("allow_public_bind", False))
         self.allow_remote_control: bool = bool(server_cfg.get("allow_remote_control", False))
         self.allowed_ips: list[str] = list(server_cfg.get("allowed_ips", []) or [])
+        self.default_session: str = server_cfg.get("default_session", "cc")
 
-        self.jwt = APNsJWT(
-            p8_path=self.p8_path,
-            key_id=self.key_id,
-            team_id=self.team_id,
-        )
-        # primary client 跟 self.sandbox 配合 (默认是 config 里设的)
-        self.client = APNsClient(
-            bundle_id=self.bundle_id,
-            jwt_provider=self.jwt,
-            sandbox=self.sandbox,
-            live_activity_disabled=self.live_activity_disabled,
-        )
-        # alt client 跟 primary 相反 当 BadDeviceToken 时 fallback 试这个
-        # 解 5-1 BadDeviceToken 反复问题 — token 的 endpoint 不一定跟 server 配置一致
-        # (例 TestFlight 通常 prod 但开发 build 是 sandbox 一台 device 在两种 build 间切会改 endpoint)
-        self.client_alt = APNsClient(
-            bundle_id=self.bundle_id,
-            jwt_provider=self.jwt,
-            sandbox=not self.sandbox,
-            live_activity_disabled=self.live_activity_disabled,
-        )
-        self._primary_endpoint = "sandbox" if self.sandbox else "prod"
-        self._alt_endpoint = "prod" if self.sandbox else "sandbox"
+        if self.apns_enabled:
+            self.jwt = APNsJWT(
+                p8_path=self.p8_path,
+                key_id=self.key_id,
+                team_id=self.team_id,
+            )
+            # primary client 跟 self.sandbox 配合 (默认是 config 里设的)
+            self.client = APNsClient(
+                bundle_id=self.bundle_id,
+                jwt_provider=self.jwt,
+                sandbox=self.sandbox,
+                live_activity_disabled=self.live_activity_disabled,
+            )
+            # alt client 跟 primary 相反 当 BadDeviceToken 时 fallback 试这个
+            # 解 5-1 BadDeviceToken 反复问题 — token 的 endpoint 不一定跟 server 配置一致
+            # (例 TestFlight 通常 prod 但开发 build 是 sandbox 一台 device 在两种 build 间切会改 endpoint)
+            self.client_alt = APNsClient(
+                bundle_id=self.bundle_id,
+                jwt_provider=self.jwt,
+                sandbox=not self.sandbox,
+                live_activity_disabled=self.live_activity_disabled,
+            )
+            self._primary_endpoint = "sandbox" if self.sandbox else "prod"
+            self._alt_endpoint = "prod" if self.sandbox else "sandbox"
+            self.notification_client = APNsClient(
+                bundle_id=self.bundle_id,
+                jwt_provider=self.jwt,
+                sandbox=False,
+            )
+        else:
+            self.jwt = None
+            self.client = None
+            self.client_alt = None
+            self._primary_endpoint = None
+            self._alt_endpoint = None
+            self.notification_client = None
 
         self.tokens = TokenStore(self.token_store_path)
 
         # standard remote notification device tokens (非 Live Activity)
         device_tokens_path = Path(self.token_store_path).parent / "device_tokens.jsonl"
         self.device_tokens = DeviceTokenStore(device_tokens_path)
-        # 通知推送 client 强制走 production (device token 的 endpoint 跟 Live Activity 独立)
-        self.notification_client = APNsClient(
-            bundle_id=self.bundle_id,
-            jwt_provider=self.jwt,
-            sandbox=False,
-        )
 
         # task queue 持久化跟 token 同目录
         task_queue_path = Path(self.token_store_path).parent / "task_queue.json"
@@ -416,11 +433,11 @@ class ServerState:
         # 当前活跃 chain session (slash /switch 持久化)
         active_session_path = Path(self.token_store_path).expanduser().parent / "active_session.json"
         self.active_session_path = active_session_path
-        self.active_session: str = "opia"  # default
+        self.active_session: str = self.default_session  # default
         if active_session_path.exists():
             try:
                 _as = json.loads(active_session_path.read_text())
-                self.active_session = _as.get("active_sid", "opia")
+                self.active_session = _as.get("active_sid", self.default_session)
             except Exception:
                 pass
         self.diary = Diary(Path("~/Documents/星原/眠的小家/日记/").expanduser())
@@ -447,8 +464,9 @@ class ServerState:
         self.config: dict[str, Any] = config
 
         logger.info(
-            "loaded bundle_id=%s sandbox=%s store=%s tokens=%d tasks_active=%s",
-            self.bundle_id,
+            "loaded apns_enabled=%s bundle_id=%s sandbox=%s store=%s tokens=%d tasks_active=%s",
+            self.apns_enabled,
+            self.bundle_id or "(none)",
             self.sandbox,
             self.token_store_path,
             len(self.tokens.all_active()),
@@ -456,7 +474,8 @@ class ServerState:
         )
 
     def shutdown(self):
-        self.client.close()
+        if self.client:
+            self.client.close()
 
 
 # ---------- helpers ----------

@@ -35,6 +35,7 @@ The whole thing is **local-first** — your messages never go through our server
 - iPhone running iOS 18+.
 - One of: Tailscale, ZeroTier, or just LAN (if your iPhone is on the same Wi-Fi).
 - Optionally: an Apple Developer account if you want native APNs. Skip it and [Bark](https://github.com/Finb/Bark) covers the push channel.
+- **Xcode 16.3 or newer** (Swift tools 6.1+) to build the iOS app from source. Earlier Xcode versions may fail to resolve GRDB 7.10.0. If you are on Xcode ≤ 16.2, install via TestFlight instead of building from source.
 
 ## Quick start
 
@@ -70,7 +71,7 @@ For the iOS side, install via TestFlight: <https://testflight.apple.com/join/PLA
               └─────────────┬────────────┘
                             │  tmux send-keys / capture-pane
               ┌─────────────▼────────────┐
-              │  tmux session "opia"     │
+              │  tmux session "cc"       │
               │  └ claude (CLI agent)    │
               └──────────────────────────┘
 ```
