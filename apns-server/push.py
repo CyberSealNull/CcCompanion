@@ -4078,8 +4078,23 @@ class PushHandler(BaseHTTPRequestHandler):
         # (build 199 fix: /switch 后 iOS 没传 session 字段也能 follow active)
         session = body.get("session") or self.state.active_session or self.state.default_session
         enter = bool(body.get("enter", True))
+        # 2026-05-19 新增 key 字段: 真发特殊键 (Escape / Up / Down / Enter / Tab / C-c)
+        # 跟 keys (文本) 区分 — keys 走 paste-buffer 文本注入 / key 走 send-keys 键名
+        # 解决之前 sendEscape sendRawKey("Escape") 字面粘到 shell 不是真按 esc 的问题
+        special_key = body.get("key")
+        SPECIAL_KEY_WHITELIST = {"Escape", "Up", "Down", "Enter", "Tab", "C-c", "C-l"}
+        if special_key:
+            if special_key not in SPECIAL_KEY_WHITELIST:
+                self._send_json(400, {"error": f"key not in whitelist: {special_key}"})
+                return
+            try:
+                subprocess.run(["tmux", "send-keys", "-t", session, special_key], check=False)
+                self._send_json(200, {"ok": True, "session": session, "key": special_key})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
         if not keys and not enter:
-            self._send_json(400, {"error": "keys or enter required"})
+            self._send_json(400, {"error": "keys or enter or key required"})
             return
         try:
             if keys:

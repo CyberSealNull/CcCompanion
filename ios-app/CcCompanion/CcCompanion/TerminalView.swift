@@ -139,12 +139,74 @@ final class TerminalViewModel: ObservableObject {
         }
     }
 
+    // 2026-05-19 真发特殊键 走 server 新增 `key` 字段 (tmux send-keys 键名)
+    // 之前 sendRawKey(keys="Escape") 实际把字符串 Escape 字面粘到 shell — 假功能
+    // 见 ~/Opia/work/done/2026-05-19_ccc-终端工具栏-加快捷按钮-implement-result.md
+    enum TerminalSpecialKey: String {
+        case escape = "Escape"
+        case up = "Up"
+        case down = "Down"
+        case enter = "Enter"
+        case tab = "Tab"
+        case ctrlC = "C-c"
+        case ctrlL = "C-l"  // 2026-05-19 clear 按钮 (跑 Claude Code 时不能 paste "clear" 字面字符串)
+    }
+
+    func sendSpecialKey(_ key: TerminalSpecialKey) async {
+        await ensureSessionSelected()
+        guard !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let url = CcServerConfig.serverURL.appendingPathComponent("tmux/send")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let secret = CcServerConfig.sharedSecret, !secret.isEmpty {
+            req.setValue(secret, forHTTPHeaderField: "X-Auth-Token")
+        }
+        let payload: [String: Any] = [
+            "session": session,
+            "key": key.rawValue,
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        _ = try? await urlSession.data(for: req)
+        // 立即 fetch 一次 让用户看到按键效果
+        await fetchCapture()
+    }
+
+    func sendRepeatedSpecialKey(_ key: TerminalSpecialKey, count: Int) async {
+        for _ in 0..<count {
+            await sendSpecialKey(key)
+            try? await Task.sleep(nanoseconds: 80_000_000)  // 80ms 间隔
+        }
+    }
+
+    // 2026-05-19 clear 按钮真实意图 — 清 Claude Code chain 历史 (/clear slash)
+    // 不是清终端画面 (Claude Code TUI 拦截 C-l 改 redraw 那条路对用户没意义)
+    func sendSlashClear() async {
+        await ensureSessionSelected()
+        guard !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let url = CcServerConfig.serverURL.appendingPathComponent("tmux/send")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let secret = CcServerConfig.sharedSecret, !secret.isEmpty {
+            req.setValue(secret, forHTTPHeaderField: "X-Auth-Token")
+        }
+        let payload: [String: Any] = [
+            "keys": "/clear",
+            "session": session,
+            "enter": true,
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        _ = try? await urlSession.data(for: req)
+        await fetchCapture()
+    }
+
     func sendCtrlC() async {
-        await sendRawKey("C-c")
+        await sendSpecialKey(.ctrlC)
     }
 
     func sendEscape() async {
-        await sendRawKey("Escape")
+        await sendSpecialKey(.escape)
     }
 
     // 2026-05-14 build 197 — 清屏 输 "clear" + Enter (走 shell clear)
@@ -265,6 +327,24 @@ struct TerminalView: View {
                 .background(Color.red.opacity(0.12))
             }
 
+            // 2026-05-19 快捷按钮工具栏 (Esc / ↑ / ↑↑ / ↓ / Enter / clear)
+            // 只在 Terminal tab 显示 chat tab 不显 (此处 view 本身就是 Terminal tab)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    TerminalShortcutButton(label: "Esc") { Task { await vm.sendSpecialKey(.escape) } }
+                    TerminalShortcutButton(label: "↑") { Task { await vm.sendSpecialKey(.up) } }
+                    TerminalShortcutButton(label: "↑↑") { Task { await vm.sendRepeatedSpecialKey(.up, count: 2) } }
+                    TerminalShortcutButton(label: "↓") { Task { await vm.sendSpecialKey(.down) } }
+                    TerminalShortcutButton(label: "Enter") { Task { await vm.sendSpecialKey(.enter) } }
+                    TerminalShortcutButton(label: "clear") { Task { await vm.sendSlashClear() } }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+            }
+            .frame(height: 40)
+            .background(Color.ccCard)
+            .overlay(Rectangle().fill(Color.ccTextDim.opacity(0.12)).frame(height: 1), alignment: .top)
+
             // 输入区 — prompt 风
             HStack(spacing: 8) {
                 Text("$")
@@ -281,14 +361,9 @@ struct TerminalView: View {
                     .autocorrectionDisabled(true)
                     .textInputAutocapitalization(.never)
 
-                // 2026-05-14 build 197 — 清屏按钮 输入框左边 用户 push 加
-                Button {
-                    Task { await vm.sendClearScreen() }
-                } label: {
-                    Image(systemName: "eraser")
-                        .font(.ccSerifAdaptive(size: 18, weight: .semibold))
-                        .foregroundStyle(Color.ccTextDim)
-                }
+                // 2026-05-19 删旧橡皮擦清屏按钮 — 工具栏已有 clear 按钮 (走 /clear slash) 双入口混淆
+                // 原 vm.sendClearScreen() paste "clear"+Enter 行为跟工具栏 /clear 不一致 (一个 user msg 一个 slash)
+                // 工具栏 clear 是 user-facing 单一入口. sendClearScreen() function 保留 dead 不删
                 // Phase D amendment #19 — ESC + ^C 按钮删 (走 /stop slash 命令中断)
                 Button {
                     Task { await vm.send() }
@@ -310,6 +385,29 @@ struct TerminalView: View {
         #endif
         .onAppear { vm.start() }
         .onDisappear { vm.stop() }
+    }
+}
+
+// 2026-05-19 终端快捷按钮 — 输入框上方横排 monospace 胶囊
+private struct TerminalShortcutButton: View {
+    let label: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 13, design: .monospaced).weight(.medium))
+                .foregroundStyle(Color.ccText)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.ccBg)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.ccTextDim.opacity(0.25), lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
     }
 }
 
