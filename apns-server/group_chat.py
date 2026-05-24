@@ -508,6 +508,51 @@ class GroupChatStore:
             "events": events,
         }
 
+    def update_record_delivery(self, msg_id: str, delivery: dict[str, Any]) -> bool:
+        """Build 219 r4 item 2 — overwrite the delivery field of an existing record.
+
+        Used by push.py `_group_fan_out` to persist the actual delivered / failed
+        targets back to disk after Popen returns (the initial `append()` line had
+        delivered=[] because fan-out hadn't run yet). Without this, the on-disk
+        jsonl forever shows delivered=[] even when delivery succeeded.
+
+        Rewrites the whole jsonl in place — fine for the workgroup scale
+        (tens of records / day). For larger scale add an index.
+        """
+        if not self.path.exists():
+            return False
+        with self._lock:
+            lines: list[str] = []
+            found = False
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    for line in f:
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        try:
+                            rec = json.loads(stripped)
+                        except json.JSONDecodeError:
+                            lines.append(stripped)
+                            continue
+                        if rec.get("id") == msg_id:
+                            rec["delivery"] = delivery
+                            lines.append(json.dumps(rec, ensure_ascii=False))
+                            found = True
+                        else:
+                            lines.append(stripped)
+            except Exception:
+                return False
+            if not found:
+                return False
+            try:
+                with open(self.path, "w", encoding="utf-8") as f:
+                    for line in lines:
+                        f.write(line + "\n")
+            except Exception:
+                return False
+        return True
+
     def delete(self, msg_id: str) -> bool:
         """Delete a message by id. Rewrites jsonl in place."""
         if not self.path.exists():

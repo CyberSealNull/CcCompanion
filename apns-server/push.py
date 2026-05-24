@@ -2414,6 +2414,13 @@ class PushHandler(BaseHTTPRequestHandler):
             delivery["failed"] = list(targets)
             for agent_id in targets:
                 self.state.group_chat.set_typing(agent_id, False, dispatch_id=dispatch_id)
+        # Build 219 r4 item 2 — persist post-fan-out delivery back to jsonl so the on-disk
+        # record reflects the true delivered/failed (previous behavior left delivered=[]
+        # on disk forever, only in-memory rec was correct).
+        try:
+            self.state.group_chat.update_record_delivery(rec["id"], delivery)
+        except Exception as e:
+            logger.warning("group delivery persist fail: %s", e)
         return dispatch_id
 
     def _infer_group_task_owner(self, body: dict[str, Any], mentions: list[str]) -> str | None:
