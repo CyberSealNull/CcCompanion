@@ -48,12 +48,15 @@ enum CcTheme: String, CaseIterable, Identifiable {
     case terminal
     // Phase E 2026-05-11 — wechatLight/wechatDark 删 (终端字 wechat 主题下看不清). 加 night 纯深主题.
     case night
+    // v1.2 2026-06-12 — 微信「伪装」主题: 浅灰底 + 绿/白气泡 + 头像, 切到它自动隐藏 thinking/旁白/和弦色边等 AI 元素.
+    case wechat
     var id: String { rawValue }
     var displayName: String {
         switch self {
         case .warm: return "暖橙"
         case .terminal: return "终端"
         case .night: return "夜间"
+        case .wechat: return "微信"
         }
     }
 }
@@ -106,6 +109,7 @@ final class ThemeStore: ObservableObject {
     /// (nil = follow system, else locked to schemePref with `.system` falling back to `.light`).
     var preferredColorScheme: ColorScheme? {
         if theme == .terminal || theme == .night { return .dark }
+        if theme == .wechat { return .light }   // 微信伪装主题固定浅色, 不跟系统深色
         if followSystemColorScheme { return nil }
         return schemePref.swiftUIScheme ?? .light
     }
@@ -178,12 +182,22 @@ extension Color {
     private static let nightAccent = Color(red: 0.95, green: 0.75, blue: 0.30)         // = warmAccent.dark 亮暖橙
     private static let nightUserText = Color.white                                     // = warmUserText.dark
 
+    // ==== 微信伪装主题 (v1.2, 固定浅色) ====
+    private static let wechatBg = Color(red: 0.929, green: 0.929, blue: 0.929)          // #EDEDED 聊天背景浅灰
+    private static let wechatCard = Color(red: 0.97, green: 0.97, blue: 0.97)           // 卡片 / 浮动栏 近白
+    private static let wechatOther = Color.white                                        // 对方白气泡
+    private static let wechatMine = Color(red: 0.584, green: 0.925, blue: 0.412)        // #95EC69 自己绿气泡
+    private static let wechatText = Color(red: 0.094, green: 0.094, blue: 0.094)        // #181818 近黑正文
+    private static let wechatTextDim = Color(red: 0.53, green: 0.53, blue: 0.53)        // 次级灰
+    private static let wechatAccent = Color(red: 0.027, green: 0.756, blue: 0.376)      // #07C160 微信绿 accent
+
     // ==== 主题路由 ====
     static var ccBg: Color {
         switch ThemeStore.shared.theme {
         case .terminal: return termBg
         case .night: return nightBg
         case .warm: return warmBg
+        case .wechat: return wechatBg
         }
     }
     static var ccCard: Color {
@@ -191,6 +205,7 @@ extension Color {
         case .terminal: return termCard
         case .night: return nightCard
         case .warm: return warmCard
+        case .wechat: return wechatCard
         }
     }
     // 2026-05-12 T1 + 23:44 follow-system fix — FloatingTabBar must NOT collapse
@@ -206,12 +221,14 @@ extension Color {
         case .terminal: return termCard
         case .night: return nightCard
         case .warm: return warmCard
+        case .wechat: return wechatCard
         }
     }
     static var ccFloatingBarText: Color {
         switch ThemeStore.shared.theme {
         case .terminal, .night: return ccText
         case .warm: return warmText
+        case .wechat: return wechatText
         }
     }
     static var ccAssistant: Color {
@@ -219,6 +236,7 @@ extension Color {
         case .terminal: return termAssistant
         case .night: return nightAssistant
         case .warm: return warmAssistant
+        case .wechat: return wechatOther
         }
     }
     static var ccUser: Color {
@@ -226,6 +244,7 @@ extension Color {
         case .terminal: return termUser
         case .night: return nightUser
         case .warm: return warmUser
+        case .wechat: return wechatMine
         }
     }
     static var ccText: Color {
@@ -233,6 +252,7 @@ extension Color {
         case .terminal: return termText
         case .night: return nightText
         case .warm: return warmText
+        case .wechat: return wechatText
         }
     }
     static var ccTextDim: Color {
@@ -242,12 +262,14 @@ extension Color {
         case .night: return nightTextDim
         case .warm: return Color(light: Color(red: 0.45, green: 0.40, blue: 0.36),
                                   dark: Color.white.opacity(0.85))
+        case .wechat: return wechatTextDim
         }
         #else
         switch ThemeStore.shared.theme {
         case .terminal: return termTextDim
         case .night: return nightTextDim
         case .warm: return warmTextDim
+        case .wechat: return wechatTextDim
         }
         #endif
     }
@@ -256,6 +278,7 @@ extension Color {
         case .terminal: return termAccent
         case .night: return nightAccent
         case .warm: return warmAccent
+        case .wechat: return wechatAccent
         }
     }
     static var ccUserText: Color {
@@ -263,6 +286,7 @@ extension Color {
         case .terminal: return termUserText
         case .night: return nightUserText
         case .warm: return warmUserText
+        case .wechat: return wechatText
         }
     }
     static var ccAssistantText: Color {
@@ -270,6 +294,7 @@ extension Color {
         case .terminal: return Color.white
         case .night: return nightText
         case .warm: return Color.white
+        case .wechat: return wechatText
         }
     }
 }
@@ -3563,6 +3588,15 @@ private struct ChatInputBar: View {
                 }
             }
 
+            // 微信伪装主题: 补一个「表情」键凑齐 微信式 [加号 Menu + 麦克风内嵌输入框 + 表情 + 发送] 布局.
+            // 麦克风已内嵌 TextField (build 93 "跟微信一致"), 加号=附件 Menu; 此 emoji 键 repurpose 为插入表情.
+            if ThemeStore.shared.theme == .wechat {
+                Button { draftLocal += "😊" } label: {
+                    Image(systemName: "face.smiling")
+                        .font(.ccSerifAdaptive(size: 20, weight: .semibold))
+                        .foregroundStyle(Color.ccTextDim)
+                }
+            }
             Button { commitFromSendButton() } label: {
                 Image(systemName: (vm.sending || commitPending) ? "ellipsis.circle" : "paperplane.fill")
                     .font(.ccSerifAdaptive(size: 20, weight: .semibold))
@@ -4227,17 +4261,22 @@ private struct ChatListView: View {
         case .separator(let label, _):
             ChatSeparatorRow(label: label)
         case .toolStack(let stack):
-            ToolActivityStackView(stack: stack)
-                .id("stack_\(stack.id)")
-                .transition(.asymmetric(
-                    insertion: .scale(scale: 0.94, anchor: .bottom).combined(with: .opacity),
-                    removal: .opacity
-                ))
+            // 微信伪装主题: 工具活动卡也属 AI 感元素, 隐掉只留纯文字流.
+            if ThemeStore.shared.theme != .wechat {
+                ToolActivityStackView(stack: stack)
+                    .id("stack_\(stack.id)")
+                    .transition(.asymmetric(
+                        insertion: .scale(scale: 0.94, anchor: .bottom).combined(with: .opacity),
+                        removal: .opacity
+                    ))
+            }
         case .message(let msg, let showTime):
             VStack(alignment: .leading, spacing: 2) {
                 // Phase 2/3 (thinking-stream-render) + 2026-06-11 占位动画: 该 turn 第一条 assistant 消息上方,
                 // thinking 已拉到 → 折叠卡片; 还在路上 → 「正在思考」占位 (原地, 拉到内容卡片替占位不跳).
-                if vm.isThinkingChipAnchor(msg), let tid = msg.turnId {
+                // 微信伪装主题: thinking 卡片/占位(含亲笔旁白)全隐, 只留纯文字流.
+                if ThemeStore.shared.theme != .wechat,
+                   vm.isThinkingChipAnchor(msg), let tid = msg.turnId {
                     if let think = vm.thinkingByTurn[tid] {
                         ThinkingChip(text: think)
                     } else if vm.showsThinkingPlaceholder(tid) {
@@ -4724,6 +4763,84 @@ private struct ThinkingPlaceholder: View {
     }
 }
 
+// MARK: - 微信伪装主题专用气泡行 (v1.2)
+// 切到微信主题时, ChatMessageListRow 改渲染这个简单行: 头像 + 绿/白气泡 + 指向头像的小尖尖 + 纯文字.
+// 天然实现「伪装」—— 不含 thinking 卡片 / reactions / mood 色边等 AI 元素, 只剩纯聊天流.
+
+private struct WeChatTailTriangle: Shape {
+    let pointingRight: Bool   // true=自己(绿气泡)尖尖朝右指向右侧头像
+    func path(in r: CGRect) -> Path {
+        var p = Path()
+        if pointingRight {
+            p.move(to: CGPoint(x: r.minX, y: r.minY))
+            p.addLine(to: CGPoint(x: r.maxX, y: r.midY))
+            p.addLine(to: CGPoint(x: r.minX, y: r.maxY))
+        } else {
+            p.move(to: CGPoint(x: r.maxX, y: r.minY))
+            p.addLine(to: CGPoint(x: r.minX, y: r.midY))
+            p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
+        }
+        p.closeSubpath()
+        return p
+    }
+}
+
+private struct WeChatBubbleRow: View {
+    let message: ChatMessage
+    let showTime: Bool
+    private var isUser: Bool { message.isUser }
+
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
+    }()
+    private static let hmFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    }()
+    private var timeText: String {
+        let d = Self.isoFormatter.date(from: message.ts)
+            ?? Self.isoFormatter.date(from: message.ts.replacingOccurrences(of: "+08:00", with: "Z"))
+        return d.map { Self.hmFormatter.string(from: $0) } ?? ""
+    }
+
+    var body: some View {
+        VStack(spacing: 2) {
+            if showTime, !timeText.isEmpty {
+                Text(timeText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.ccTextDim)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 3)
+            }
+            HStack(alignment: .top, spacing: 6) {
+                if isUser { Spacer(minLength: 44) } else { CcAvatarView(role: .ai, size: 38) }
+                bubble
+                if isUser { CcAvatarView(role: .user, size: 38) } else { Spacer(minLength: 44) }
+            }
+            .padding(.horizontal, 10)
+        }
+        .padding(.vertical, 3)
+        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+    }
+
+    private var bubble: some View {
+        Text(message.text.isEmpty ? " " : message.text)
+            .font(.system(size: 16))
+            .foregroundStyle(isUser ? Color.ccUserText : Color.ccAssistantText)
+            .textSelection(.enabled)
+            .padding(.horizontal, 12).padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isUser ? Color.ccUser : Color.ccAssistant)
+            )
+            .overlay(alignment: isUser ? .topTrailing : .topLeading) {
+                WeChatTailTriangle(pointingRight: isUser)
+                    .fill(isUser ? Color.ccUser : Color.ccAssistant)
+                    .frame(width: 7, height: 11)
+                    .offset(x: isUser ? 6 : -6, y: 11)
+            }
+    }
+}
+
 private struct ChatMessageListRow: View {
     let message: ChatMessage
     let showTime: Bool
@@ -4750,6 +4867,14 @@ private struct ChatMessageListRow: View {
     var onDiscardFailed: (() -> Void)? = nil
 
     var body: some View {
+        if ThemeStore.shared.theme == .wechat {
+            WeChatBubbleRow(message: message, showTime: showTime)
+        } else {
+            standardRow
+        }
+    }
+
+    private var standardRow: some View {
         HStack(spacing: 8) {
             if multiSelectMode {
                 Image(systemName: selected ? "checkmark.circle.fill" : "circle")

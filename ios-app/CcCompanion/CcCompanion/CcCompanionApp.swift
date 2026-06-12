@@ -76,6 +76,7 @@ struct CcCompanionApp: App {
         WindowGroup {
             ContentView()
                 .ccSerifTheme()
+                .whatsNewGate()   // v1.2 新 build 首启弹 What's New
         }
         #if targetEnvironment(macCatalyst)
         .commands {
