@@ -1870,19 +1870,25 @@ final class ChatViewModel: ObservableObject {
         let merged = mergeLocalCommandMessages(into: byId.values.sorted(by: Self.chatMessageAscending))
         self.messages = merged
         // 临时扩 visibleLimit 让 target 进 visible window
-        // build 199 fix: 给 jump 后 visibleLimit 加 hard cap 1500
-        // 防止跳到几千行老消息时 visibleLimit 长期膨胀 → 内存/diff 压力
-        // 用户回底部触发 resetVisibleWindowToRecent 收回默认 300
+        // 2026-06-11 jump-fix(2/3): 去掉 build 199 的 1500 hard cap——cap 让跳超老消息时
+        // target 永不进渲染窗, scrollTo 对不存在的 id 静默 no-op, 跳转必失败。
+        // 跳转正确性 > 暂时膨胀: 回底部 resetVisibleWindowToRecent 仍会收回 300,
+        // 膨胀只活到回底那一刻, 不是长期驻留。
+        var resolvedTargetId = targetMsg.id
         if let targetIdx = merged.firstIndex(where: { $0.id == targetMsg.id || $0.ts == ts }) {
-            let kJumpVisibleHardCap = 1500
-            let needWindow = min(merged.count - targetIdx + 50, kJumpVisibleHardCap)
+            // 乐观发送的本地版(id=localId)与 server 版(id=ts+role)指同一条消息时,
+            // scrollTo 必须用列表里真实存在的那个 id, 否则滚动目标不存在。
+            resolvedTargetId = merged[targetIdx].id
+            let needWindow = merged.count - targetIdx + 50
             if needWindow > visibleLimit {
                 visibleLimit = needWindow
             }
         }
         // 清搜索 + 设 scroll target 让 ChatListView 监听后滚到位
+        // 2026-06-11 jump-fix(1/3 公开版): 信号本就后置(数据+窗口落地后才发, 公开版无私版的预发 bug)。
+        // messages/visibleLimit 的 didSet 已同步 rebuild displayedRowsCache, onChange 触发时目标行必然已在列表里。
         clearSearch()
-        jumpScrollTarget = targetMsg.id
+        jumpScrollTarget = resolvedTargetId
     }
 
     /// 2026-05-07 用户 push: 紧急停止 chain. POST /chain/abort
@@ -4180,10 +4186,15 @@ private struct ChatListView: View {
                         scrollToBottom(proxy: proxy, delay: 0.05)
                         return
                     }
-                    if (isUserScrolledUp || suppressActive) && newOthersCount > 0 {
-                        // 用户在上面看历史 / loadEarlier 期间 不 auto scroll 累计 unread (只算别人发的)
-                        if !suppressActive { unreadCount += newOthersCount }
-                    } else {
+                    // 2026-06-11 jump-fix(公开版对位): jump 期间(jumpScrollTarget != nil)不 auto scroll-bottom。
+                    // 公开版无私版的 jumpInProgressUntil/suppressingProgrammaticJump, 用 jumpScrollTarget 等价守卫
+                    // (跟下方 displayedRowsCache.count onChange 的 jumpScrollTarget==nil 守卫同一惯用法), 否则
+                    // 跳老消息时 merge 撑大 messages.count → 本 onChange else 分支 scrollToBottom+resetVisibleWindow
+                    // 会把刚扩的窗收回 300 并弹回底, 三刀全白做。jumpScrollTarget==nil(99% 时)守卫是 no-op 零回归。
+                    if (isUserScrolledUp || suppressActive || vm.jumpScrollTarget != nil) && newOthersCount > 0 {
+                        // 用户在上面看历史 / loadEarlier / jump 期间 不 auto scroll 累计 unread (只算别人发的)
+                        if !suppressActive && vm.jumpScrollTarget == nil { unreadCount += newOthersCount }
+                    } else if vm.jumpScrollTarget == nil {
                         unreadCount = 0
                         vm.resetVisibleWindowToRecent()
                         // 不带动画 直接 scroll 不再跟 cache append 撞 视觉上稳
@@ -4209,12 +4220,18 @@ private struct ChatListView: View {
                 }
                 .onChange(of: vm.jumpScrollTarget) { _, target in
                     guard let target else { return }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                        withAnimation(.easeOut(duration: 0.3)) {
-                            proxy.scrollTo(target, anchor: .center)
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            vm.jumpScrollTarget = nil
+                    // 2026-06-11 jump-fix(3/3): 单次 scrollTo 改三连校准。LazyVStack 未渲染行
+                    // 的高度是估算值, 一次 scrollTo 落点必偏(文本/图片/工具行混排时尤甚),
+                    // 这就是"跳了但停在错的位置"的根。首滚把目标附近真实渲染出来, 二三滚
+                    // 基于真实行高落准——LazyVStack scrollTo 偏移的标准 workaround。
+                    // guard 比对 target: 期间用户又点了别的跳转就让位给新目标的三连滚。
+                    for (i, delay) in [0.15, 0.55, 1.1].enumerated() {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                            guard vm.jumpScrollTarget == target else { return }
+                            withAnimation(i == 0 ? .easeOut(duration: 0.3) : nil) {
+                                proxy.scrollTo(target, anchor: .center)
+                            }
+                            if i == 2 { vm.jumpScrollTarget = nil }
                         }
                     }
                 }
