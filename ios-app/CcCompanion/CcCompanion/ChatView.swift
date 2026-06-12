@@ -2102,12 +2102,22 @@ final class ChatViewModel: ObservableObject {
         _ = try? await session.data(for: req)
     }
 
+    // 刀三 (僵尸修复 2026-06-12): 旧逻辑直接字符串截取 ISO ts 的 HH:mm, 优化消息 ts 存的是 UTC(Z)
+    // → 失败行时间戳显示 UTC 差整 8 小时(09:57 应为 17:57)。改走解析 ISO + 本地时区 DateFormatter。
+    // canonical 消息 ts 是 +08:00, 解析成 instant 后本地格式化仍是正确本地时间, 不回归。
+    private static let isoTimeParser: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
+    }()
+    private static let localHMFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; f.locale = Locale(identifier: "en_US_POSIX"); return f
+    }()
     private static func shortTime(_ ts: String) -> String {
-        let parts = ts.split(separator: "T")
-        if parts.count >= 2 {
-            return String(parts[1].prefix(5))
+        if let d = isoTimeParser.date(from: ts) ?? ISO8601DateFormatter().date(from: ts) {
+            return localHMFormatter.string(from: d)   // 本地时区 (DateFormatter 默认设备时区)
         }
-        return String(ts.prefix(5))
+        // 解析失败兜底: 老逻辑字符串截取
+        let parts = ts.split(separator: "T")
+        return parts.count >= 2 ? String(parts[1].prefix(5)) : String(ts.prefix(5))
     }
 
     private static func displayName(for role: String) -> String {
@@ -2301,7 +2311,7 @@ final class ChatViewModel: ObservableObject {
         if let secret = CcServerConfig.sharedSecret, !secret.isEmpty {
             req.setValue(secret, forHTTPHeaderField: "X-Auth-Token")
         }
-        req.timeoutInterval = 8
+        req.timeoutInterval = 15   // 刀二 (僵尸修复): 8→15, 弱网/抖动大时 8 秒误判失败率高
         var payload: [String: Any] = ["text": text]
         if let q = quotedTs { payload["quoted_ts"] = q }
         req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
@@ -2648,10 +2658,13 @@ final class ChatViewModel: ObservableObject {
             }
         }
 
+        // 刀一 (僵尸修复 2026-06-12): 老僵尸的 canonical 证据可能滚出内存 messages 窗口(load 仅 latest 200)
+        // → 只查内存永远洗不清白。除内存外再查 GRDB(chatStore.latest 拉 canonical)。对消窗 ±120→±600。
+        let dbCanonicals = chatStore.latest(limit: 5000).filter { $0.localId == nil }
         let locals = messages.filter { $0.localId?.hasPrefix("local-") == true }
         for local in locals {
             guard let localDate = formatter.date(from: local.ts) else { continue }
-            let matchedCanonical = messages.contains { candidate in
+            let isMatch: (ChatMessage) -> Bool = { candidate in
                 guard candidate.localId == nil,
                       candidate.role == local.role,
                       candidate.text == local.text,
@@ -2659,8 +2672,9 @@ final class ChatViewModel: ObservableObject {
                       let candidateDate = formatter.date(from: candidate.ts) else {
                     return false
                 }
-                return abs(candidateDate.timeIntervalSince(localDate)) <= 120
+                return abs(candidateDate.timeIntervalSince(localDate)) <= 600
             }
+            let matchedCanonical = messages.contains(where: isMatch) || dbCanonicals.contains(where: isMatch)
             if matchedCanonical {
                 messages.removeAll { $0.id == local.id }
                 sendingIds.remove(local.id)
