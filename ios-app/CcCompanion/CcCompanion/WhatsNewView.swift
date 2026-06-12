@@ -10,10 +10,13 @@
 
 import SwiftUI
 
-struct WhatsNewEntry: Codable, Equatable {
+struct WhatsNewEntry: Codable, Equatable, Identifiable {
     let title: String
     let items: [String]
     var footer: String? = nil
+
+    // sheet(item:) 驱动用; 不参与 Codable (computed)。
+    var id: String { title + items.joined() }
 }
 
 enum WhatsNewSource {
@@ -120,17 +123,15 @@ struct WhatsNewSheet: View {
 // MARK: - 启动 gate (挂 ContentView 上, 新 build 首启弹一次, 看完记录不再弹)
 
 struct WhatsNewGate: ViewModifier {
+    // sheet(item:) 驱动: entry 非 nil 才弹, 弹时数据必在 — 根治 isPresented 时序竞争弹空 sheet。
     @State private var entry: WhatsNewEntry? = nil
-    @State private var presented = false
 
     func body(content: Content) -> some View {
         content
             .task { await checkOnce() }
-            .sheet(isPresented: $presented) {
-                if let entry {
-                    WhatsNewSheet(entry: entry, onClose: markSeenAndDismiss)
-                        .presentationDetents([.medium, .large])
-                }
+            .sheet(item: $entry) { e in
+                WhatsNewSheet(entry: e, onClose: markSeenAndDismiss)
+                    .presentationDetents([.medium, .large])
             }
     }
 
@@ -140,14 +141,14 @@ struct WhatsNewGate: ViewModifier {
         // 已看过当前 build → 不弹
         if UserDefaults.standard.string(forKey: WhatsNewSource.lastSeenKey) == build { return }
         if let e = await WhatsNewSource.fetchEntry(forBuild: build) {
-            await MainActor.run { entry = e; presented = true }
+            await MainActor.run { entry = e }
         }
         // 当 build 没有文案 → 不弹也不标 lastSeen (将来 GitHub 加上该 build 条目再弹)。
     }
 
     private func markSeenAndDismiss() {
         UserDefaults.standard.set(WhatsNewSource.currentBuild, forKey: WhatsNewSource.lastSeenKey)
-        presented = false
+        entry = nil
     }
 }
 
