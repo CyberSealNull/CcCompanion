@@ -4639,20 +4639,22 @@ private func timelineKind(for msg: ChatMessage) -> TimelineNodeKind {
 
 private struct ChatSeparatorRow: View {
     let label: String
+    // 2026-06-13 字体响应式修复: observe theme, 否则切主题分隔行字体/色卡住不重算.
+    @ObservedObject private var themeStore = ThemeStore.shared
 
     var body: some View {
         HStack {
             Spacer()
             Text(label)
-                .font(ThemeStore.shared.theme == .wechat
+                .font(themeStore.theme == .wechat
                     ? .system(size: 12)
                     : .ccSerifAdaptive(size: 11))
-                .foregroundStyle(ThemeStore.shared.theme == .wechat
+                .foregroundStyle(themeStore.theme == .wechat
                     ? Color(red: 0.6, green: 0.6, blue: 0.6)
                     : Color.ccTextDim)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 3)
-                .background(ThemeStore.shared.theme == .wechat
+                .background(themeStore.theme == .wechat
                     ? Color.clear
                     : Color.ccCard.opacity(0.7))
                 .clipShape(Capsule())

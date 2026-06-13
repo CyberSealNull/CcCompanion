@@ -41,8 +41,12 @@ extension Font {
 }
 
 struct CcSerifModifier: ViewModifier {
+    // 2026-06-13 字体响应式修复: 必须 @ObservedObject 才能在切主题时重算 body.
+    // 之前静态读 ThemeStore.shared.theme 没登记 SwiftUI 依赖, 进过微信主题(字体=system)
+    // 切回暖橙/夜间字体卡在 system 不回 serif.
+    @ObservedObject private var themeStore = ThemeStore.shared
     func body(content: Content) -> some View {
-        if ThemeStore.shared.theme == .wechat {
+        if themeStore.theme == .wechat {
             content
                 .font(.system(size: 17))
         } else {
