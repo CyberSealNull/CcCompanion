@@ -168,4 +168,85 @@ struct FloatingTabBar: View {
     }
 }
 
+struct WeChatTabBar: View {
+    let items: [FloatingTabBarItem]
+    @Binding var selection: Int
+
+    private let wechatGreen = Color(red: 0.027, green: 0.756, blue: 0.376)
+    private let inactiveGray = Color(red: 0.478, green: 0.478, blue: 0.478)
+    private let barBg = Color(red: 0.969, green: 0.969, blue: 0.969)
+    private let hairline = Color(red: 0.898, green: 0.898, blue: 0.898)
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Rectangle()
+                .fill(hairline)
+                .frame(height: 0.5)
+            HStack(spacing: 0) {
+                ForEach(items) { item in
+                    let isActive = item.id == selection
+                    Button {
+                        selection = item.id
+                    } label: {
+                        VStack(spacing: 3) {
+                            ZStack(alignment: .topTrailing) {
+                                Image(systemName: isActive ? fillVariant(item.systemImage) : item.systemImage)
+                                    .font(.system(size: 22))
+                                    .foregroundStyle(isActive ? wechatGreen : inactiveGray)
+                                wechatBadge(for: item.badge)
+                                    .offset(x: 6, y: -4)
+                            }
+                            Text(item.title)
+                                .font(.system(size: 10))
+                                .foregroundStyle(isActive ? wechatGreen : inactiveGray)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 6)
+                        .padding(.bottom, 2)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("tab-\(item.id)")
+                }
+            }
+            .padding(.bottom, 2)
+        }
+        .background(barBg)
+        .ignoresSafeArea(.keyboard, edges: .bottom)
+    }
+
+    private func fillVariant(_ name: String) -> String {
+        let fillName = name.hasSuffix(".fill") ? name : name + ".fill"
+        if UIImage(systemName: fillName) != nil { return fillName }
+        return name
+    }
+
+    @ViewBuilder
+    private func wechatBadge(for style: BadgeStyle) -> some View {
+        switch style {
+        case .none:
+            EmptyView()
+        case .unreadDot:
+            Circle()
+                .fill(Color.red)
+                .frame(width: 8, height: 8)
+        case .mentionAt:
+            ZStack {
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 14, height: 14)
+                Text("@")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.white)
+            }
+        case .count(let n):
+            Text("\(n)")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(Color.red))
+        }
+    }
+}
+
 #endif

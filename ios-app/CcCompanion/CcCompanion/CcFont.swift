@@ -2,7 +2,11 @@ import SwiftUI
 
 extension Font {
     /// Mac Catalyst: fallback to system SF Pro at +20% size for sharper rendering; iOS: use CcSerif (STSongti-SC)
+    /// WeChat theme: always system font (spec item 6)
     static func ccSerifAdaptive(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        if ThemeStore.shared.theme == .wechat {
+            return Font.system(size: size, weight: weight, design: .default)
+        }
         #if targetEnvironment(macCatalyst)
         return Font.system(size: size * 1.2, weight: weight, design: .default)
         #else
@@ -38,9 +42,14 @@ extension Font {
 
 struct CcSerifModifier: ViewModifier {
     func body(content: Content) -> some View {
-        content
-            .fontDesign(.serif)
-            .font(.ccSerifAdaptive(size: 17))
+        if ThemeStore.shared.theme == .wechat {
+            content
+                .font(.system(size: 17))
+        } else {
+            content
+                .fontDesign(.serif)
+                .font(.ccSerifAdaptive(size: 17))
+        }
     }
 }
 

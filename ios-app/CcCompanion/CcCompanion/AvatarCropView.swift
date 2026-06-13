@@ -77,7 +77,9 @@ struct CcAvatarView: View {
             }
         }
         .frame(width: size, height: size)
-        .clipShape(Circle())
+        .clipShape(ThemeStore.shared.theme == .wechat
+            ? AnyShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+            : AnyShape(Circle()))
         .id("\(role == .ai ? "ai" : "user")-\(AvatarDiskStore.filename(fromStoredValue: path))")
     }
 }

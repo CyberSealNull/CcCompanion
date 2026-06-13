@@ -104,8 +104,12 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            FloatingTabBar(items: tabs, selection: $selectedTab)
-                .ignoresSafeArea(.keyboard, edges: .bottom)  // tab bar 不被 keyboard 推上去 始终保持在底部
+            if theme.theme == .wechat {
+                WeChatTabBar(items: tabs, selection: $selectedTab)
+            } else {
+                FloatingTabBar(items: tabs, selection: $selectedTab)
+                    .ignoresSafeArea(.keyboard, edges: .bottom)
+            }
         }
         .background(Color.ccBg)
         .overlay(CcToastOverlay())  // Phase D — global toast (复制/收藏 反馈)

@@ -2933,41 +2933,46 @@ struct ChatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // 2026-05-07 完整自画 header bar — iOS 26 toolbar 系统 wrap glass capsule 头像被截
-            // 顺手把右侧搜索/⊕也一起搬过来 头像跟搜索同一水平线 (用户 catch "和右边的搜索那些平行")
-            HStack(spacing: 12) {
-                ChatToolbarLeading(
-                    multiSelectMode: vm.multiSelectMode,
-                    status: statusLabel(for: vm.connectionStatus),
-                    statusColor: statusColor(for: vm.connectionStatus),
-                    isBreathing: vm.connectionStatus != .offline,
-                    aiName: aiName,
-                    aiAvatarEmoji: aiAvatarEmoji,
-                    aiAvatarPath: aiAvatarPath,
-                    onCancel: { vm.exitMultiSelect() }
-                )
-                Spacer()
-                if vm.multiSelectMode {
-                    Text("已选 \(vm.selectedTs.count) 条")
-                        .font(.ccSerifAdaptive(size: chatBodySize))
-                        .foregroundStyle(Color.ccText)
+            if ThemeStore.shared.theme == .wechat {
+                WeChatHeaderBar(aiName: aiName)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Color(red: 0.937, green: 0.937, blue: 0.937))
+            } else {
+                HStack(spacing: 12) {
+                    ChatToolbarLeading(
+                        multiSelectMode: vm.multiSelectMode,
+                        status: statusLabel(for: vm.connectionStatus),
+                        statusColor: statusColor(for: vm.connectionStatus),
+                        isBreathing: vm.connectionStatus != .offline,
+                        aiName: aiName,
+                        aiAvatarEmoji: aiAvatarEmoji,
+                        aiAvatarPath: aiAvatarPath,
+                        onCancel: { vm.exitMultiSelect() }
+                    )
+                    Spacer()
+                    if vm.multiSelectMode {
+                        Text("已选 \(vm.selectedTs.count) 条")
+                            .font(.ccSerifAdaptive(size: chatBodySize))
+                            .foregroundStyle(Color.ccText)
+                    }
+                    ChatToolbarTrailing(
+                        multiSelectMode: vm.multiSelectMode,
+                        selectedCount: vm.selectedTs.count,
+                        displayedCount: vm.selectableDisplayedMessages.count,
+                        showSearch: showSearch,
+                        onToggleAll: toggleAllDisplayedSelection,
+                        onToggleSearch: { showSearch.toggle() },
+                        onEnterRP: {
+                        },
+                        onShowFavorites: onShowFavorites,
+                        onClearChat: { showClearChatConfirm = true }
+                    )
                 }
-                ChatToolbarTrailing(
-                    multiSelectMode: vm.multiSelectMode,
-                    selectedCount: vm.selectedTs.count,
-                    displayedCount: vm.selectableDisplayedMessages.count,
-                    showSearch: showSearch,
-                    onToggleAll: toggleAllDisplayedSelection,
-                    onToggleSearch: { showSearch.toggle() },
-                    onEnterRP: {
-                    },
-                    onShowFavorites: onShowFavorites,
-                    onClearChat: { showClearChatConfirm = true }
-                )
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(Color.ccBg)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(Color.ccBg)
 
             // 搜索 search bar + filter tab — 仅 search 模式可见 自定义实现 (replace .searchable iOS 17+ bug)
             if showSearch {
@@ -3499,6 +3504,72 @@ private struct ChatInputBar: View {
     }
 
     private var inputBarHStack: some View {
+        Group {
+            if ThemeStore.shared.theme == .wechat {
+                wechatInputBar
+            } else {
+                standardInputBar
+            }
+        }
+        .padding(10)
+        .background(ThemeStore.shared.theme == .wechat
+            ? Color(red: 0.96, green: 0.96, blue: 0.96)
+            : Color.ccBg)
+    }
+
+    private var wechatInputBar: some View {
+        HStack(spacing: 8) {
+            Button {
+                if !speech.isRecording {
+                    speechPrefix = draftLocal.isEmpty ? "" : draftLocal + " "
+                }
+                Task { await speech.toggle() }
+            } label: {
+                Image(systemName: speech.isRecording ? "mic.fill" : "mic")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(speech.isRecording ? Color.red : Color(red: 0.35, green: 0.35, blue: 0.35))
+            }
+            .onChange(of: speech.transcript) { _, newValue in
+                guard !newValue.isEmpty else { return }
+                draftLocal = speechPrefix + newValue
+            }
+            TextField("", text: $draftLocal, axis: .vertical)
+                .lineLimit(1...5)
+                .font(.system(size: 17))
+                .tint(Color(red: 0.027, green: 0.756, blue: 0.376))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 7)
+                .background(Color.white)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .focused(inputFocused)
+                .submitLabel(.send)
+                .onSubmit { commitFromSubmit() }
+                .onChange(of: draftLocal) { oldValue, newValue in
+                    vm.draft = newValue
+                    if newValue.hasSuffix("\n") && !oldValue.hasSuffix("\n") {
+                        draftLocal = String(newValue.dropLast())
+                        commitFromSubmit()
+                    }
+                }
+            Button { draftLocal += "😊" } label: {
+                Image(systemName: "face.smiling")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(Color(red: 0.35, green: 0.35, blue: 0.35))
+            }
+            Menu {
+                Button { syncToVM(); onCamera() } label: { Label("拍照", systemImage: "camera") }
+                Button { syncToVM(); onImage() } label: { Label("照片", systemImage: "photo") }
+                Button { syncToVM(); onFile() } label: { Label("文件", systemImage: "doc") }
+            } label: {
+                Image(systemName: "plus.circle")
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(Color(red: 0.35, green: 0.35, blue: 0.35))
+            }
+            .disabled(vm.sending)
+        }
+    }
+
+    private var standardInputBar: some View {
         HStack(spacing: 8) {
             Menu {
                 Button {
@@ -3516,7 +3587,6 @@ private struct ChatInputBar: View {
             }
             .disabled(vm.sending)
 
-            // build 93: 图片单独按钮 摘出加号菜单
             Button {
                 syncToVM()
                 onImage()
@@ -3527,9 +3597,7 @@ private struct ChatInputBar: View {
             }
             .disabled(vm.sending)
 
-            // build 93: 麦克风搬进 TextField 内右侧 inset 跟微信一致
             ZStack(alignment: .trailing) {
-                // Phase 设置大砍 (item D) — 输入框单行起 自动扩高到 5 行 微信式 + Enter commit
                 TextField(storedPlaceholder, text: $draftLocal, axis: .vertical)
                     .lineLimit(1...5)
                     .font(.system(size: 17))
@@ -3539,7 +3607,6 @@ private struct ChatInputBar: View {
                     .focused(inputFocused)
                     .submitLabel(.send)
                     .onSubmit {
-                        // Phase A — if slash popover visible, swallow submit to select highlighted instead
                         if slashPopoverVisible, slashCandidates.indices.contains(slashHighlightIndex) {
                             selectSlashCommand(slashCandidates[slashHighlightIndex])
                             return
@@ -3547,9 +3614,7 @@ private struct ChatInputBar: View {
                         commitFromSubmit()
                     }
                     .onChange(of: draftLocal) { oldValue, newValue in
-                        // 2026-05-10 用户 push 实时同步 vm.draft 切 tab 不丢草稿 (view destroy + onAppear init from vm.draft)
                         vm.draft = newValue
-                        // Phase A — if slash popover visible and user pressed enter (\n), swallow to select instead of commit
                         if newValue.hasSuffix("\n") && !oldValue.hasSuffix("\n") {
                             if slashPopoverVisible, slashCandidates.indices.contains(slashHighlightIndex) {
                                 draftLocal = String(newValue.dropLast())
@@ -3559,30 +3624,24 @@ private struct ChatInputBar: View {
                             draftLocal = String(newValue.dropLast())
                             commitFromSubmit()
                         }
-                        // Reset highlight to 0 whenever filter changes
                         if SlashCommand.filtered(for: oldValue).count != SlashCommand.filtered(for: newValue).count {
                             slashHighlightIndex = 0
                         }
                     }
-                    // 2026-05-07 给 mic / stop button 留 trailing 位 不让 button overlay 盖正文
                     .padding(.trailing, 40)
 
                 if delayedIsWorking {
-                    // 2026-05-07 用户 push: chain working 时 mic 位变 ⏹ stop 红圆 点击调 abortChain
-                    // delayedIsWorking 加 0.5s 延迟防发送瞬间闪
                     Button {
                         Task { await vm.abortChain() }
                     } label: {
                         Image(systemName: "stop.circle.fill")
                             .font(.ccSerifAdaptive(size: 18))
-                            // 2026-05-07 用户拍砖红 #DD5050 + 0.85 不那么刺眼跟暖橙系协调
                             .foregroundStyle(Color(red: 0.866, green: 0.314, blue: 0.314).opacity(0.85))
                             .padding(.trailing, 10)
                     }
                 } else if !inputFocused.wrappedValue {
                     Button {
                         if !speech.isRecording {
-                            // Capture pre-speech text so partial results replace (not append) it
                             speechPrefix = draftLocal.isEmpty ? "" : draftLocal + " "
                         }
                         Task { await speech.toggle() }
@@ -3594,7 +3653,6 @@ private struct ChatInputBar: View {
                     }
                     .onChange(of: speech.transcript) { _, newValue in
                         guard !newValue.isEmpty else { return }
-                        // Replace the speech portion in-place — partial and final both use this path
                         draftLocal = speechPrefix + newValue
                     }
                     .alert("语音识别问题", isPresented: Binding(
@@ -3607,16 +3665,6 @@ private struct ChatInputBar: View {
                     }
                 }
             }
-
-            // 微信伪装主题: 补一个「表情」键凑齐 微信式 [加号 Menu + 麦克风内嵌输入框 + 表情 + 发送] 布局.
-            // 麦克风已内嵌 TextField (build 93 "跟微信一致"), 加号=附件 Menu; 此 emoji 键 repurpose 为插入表情.
-            if ThemeStore.shared.theme == .wechat {
-                Button { draftLocal += "😊" } label: {
-                    Image(systemName: "face.smiling")
-                        .font(.ccSerifAdaptive(size: 20, weight: .semibold))
-                        .foregroundStyle(Color.ccTextDim)
-                }
-            }
             Button { commitFromSendButton() } label: {
                 Image(systemName: (vm.sending || commitPending) ? "ellipsis.circle" : "paperplane.fill")
                     .font(.ccSerifAdaptive(size: 20, weight: .semibold))
@@ -3626,8 +3674,6 @@ private struct ChatInputBar: View {
             }
             .disabled(vm.sending || commitPending)
         }
-        .padding(10)
-        .background(Color.ccBg)
         .onAppear {
             // 2026-05-10 用户 push 切 tab 不丢草稿 view 重建 onAppear 从 vm.draft init draftLocal
             if draftLocal.isEmpty && !vm.draft.isEmpty { draftLocal = vm.draft }
@@ -3968,6 +4014,35 @@ private struct ChatToolbarTrailing: View {
                             .foregroundStyle(Color.ccAccent)
                     }
                     .accessibilityLabel("更多")
+                }
+            }
+        }
+    }
+}
+
+private struct WeChatHeaderBar: View {
+    let aiName: String
+    @ObservedObject private var theme = ThemeStore.shared
+
+    var body: some View {
+        ZStack {
+            HStack {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(Color(red: 0.094, green: 0.094, blue: 0.094))
+                Spacer()
+            }
+            Text(aiName)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(Color(red: 0.094, green: 0.094, blue: 0.094))
+            HStack {
+                Spacer()
+                Button {
+                    theme.theme = .warm
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundStyle(Color(red: 0.094, green: 0.094, blue: 0.094))
                 }
             }
         }
@@ -4561,11 +4636,17 @@ private struct ChatSeparatorRow: View {
         HStack {
             Spacer()
             Text(label)
-                .font(.ccSerifAdaptive(size: 11))
-                .foregroundStyle(Color.ccTextDim)
+                .font(ThemeStore.shared.theme == .wechat
+                    ? .system(size: 12)
+                    : .ccSerifAdaptive(size: 11))
+                .foregroundStyle(ThemeStore.shared.theme == .wechat
+                    ? Color(red: 0.6, green: 0.6, blue: 0.6)
+                    : Color.ccTextDim)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 3)
-                .background(Color.ccCard.opacity(0.7))
+                .background(ThemeStore.shared.theme == .wechat
+                    ? Color.clear
+                    : Color.ccCard.opacity(0.7))
                 .clipShape(Capsule())
             Spacer()
         }
@@ -4819,56 +4900,137 @@ private struct WeChatTailTriangle: Shape {
 private struct WeChatBubbleRow: View {
     let message: ChatMessage
     let showTime: Bool
+    var onImageTap: ((URL) -> Void)? = nil
     private var isUser: Bool { message.isUser }
 
     private static let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
     }()
-    private static let hmFormatter: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
-    }()
-    private var timeText: String {
-        let d = Self.isoFormatter.date(from: message.ts)
+
+    private var parsedDate: Date? {
+        Self.isoFormatter.date(from: message.ts)
             ?? Self.isoFormatter.date(from: message.ts.replacingOccurrences(of: "+08:00", with: "Z"))
-        return d.map { Self.hmFormatter.string(from: $0) } ?? ""
+    }
+
+    private var wechatTimeText: String {
+        guard let date = parsedDate else { return "" }
+        let cal = Calendar.current
+        let now = Date()
+        let hmFmt = DateFormatter()
+        hmFmt.dateFormat = "HH:mm"
+        let hm = hmFmt.string(from: date)
+        if cal.isDateInToday(date) { return hm }
+        if cal.isDateInYesterday(date) { return "昨天 \(hm)" }
+        let weekday = cal.component(.weekday, from: date)
+        let dayNames = ["", "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"]
+        if cal.dateComponents([.day], from: date, to: now).day ?? 8 < 7 {
+            return "\(dayNames[weekday]) \(hm)"
+        }
+        let mFmt = DateFormatter()
+        mFmt.dateFormat = "M月d日 HH:mm"
+        return mFmt.string(from: date)
     }
 
     var body: some View {
         VStack(spacing: 2) {
-            if showTime, !timeText.isEmpty {
-                Text(timeText)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Color.ccTextDim)
+            if showTime, !wechatTimeText.isEmpty {
+                Text(wechatTimeText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color(red: 0.6, green: 0.6, blue: 0.6))
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 3)
+                    .padding(.vertical, 6)
             }
-            HStack(alignment: .top, spacing: 6) {
-                if isUser { Spacer(minLength: 44) } else { CcAvatarView(role: .ai, size: 38) }
-                bubble
-                if isUser { CcAvatarView(role: .user, size: 38) } else { Spacer(minLength: 44) }
+            HStack(alignment: .top, spacing: 3) {
+                if isUser { Spacer(minLength: 60) } else { CcAvatarView(role: .ai, size: 40) }
+                bubbleContent
+                if isUser { CcAvatarView(role: .user, size: 40) } else { Spacer(minLength: 60) }
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 12)
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, showTime ? 4 : 2)
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
     }
 
-    private var bubble: some View {
+    @ViewBuilder
+    private var bubbleContent: some View {
+        if let url = message.attachmentFullURL() {
+            if message.attachmentType == "image" {
+                CachedImage(url: url) { img in
+                    img.resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: 200, maxHeight: 200)
+                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                } placeholder: {
+                    ProgressView()
+                        .frame(width: 120, height: 90)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { onImageTap?(url) }
+            } else {
+                wechatFileCard
+            }
+        } else {
+            textBubble
+        }
+    }
+
+    private var wechatFileCard: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(message.attachmentFilename ?? "文件")
+                    .font(.system(size: 15))
+                    .foregroundStyle(Color(red: 0.094, green: 0.094, blue: 0.094))
+                    .lineLimit(2)
+                Text(fileExtLabel(message.attachmentFilename))
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color(red: 0.6, green: 0.6, blue: 0.6))
+            }
+            Spacer(minLength: 4)
+            Image(systemName: wechatFileIcon(message.attachmentFilename))
+                .font(.system(size: 32, weight: .light))
+                .foregroundStyle(Color(red: 0.35, green: 0.55, blue: 0.85))
+        }
+        .padding(12)
+        .frame(maxWidth: 220)
+        .background(Color.white)
+        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+    }
+
+    private var textBubble: some View {
         Text(message.text.isEmpty ? " " : message.text)
             .font(.system(size: 16))
-            .foregroundStyle(isUser ? Color.ccUserText : Color.ccAssistantText)
+            .foregroundStyle(Color(red: 0.094, green: 0.094, blue: 0.094))
             .textSelection(.enabled)
-            .padding(.horizontal, 12).padding(.vertical, 9)
+            .padding(.horizontal, 10).padding(.vertical, 8)
             .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
                     .fill(isUser ? Color.ccUser : Color.ccAssistant)
             )
             .overlay(alignment: isUser ? .topTrailing : .topLeading) {
                 WeChatTailTriangle(pointingRight: isUser)
                     .fill(isUser ? Color.ccUser : Color.ccAssistant)
-                    .frame(width: 7, height: 11)
-                    .offset(x: isUser ? 6 : -6, y: 11)
+                    .frame(width: 6, height: 10)
+                    .offset(x: isUser ? 5 : -5, y: 10)
             }
+    }
+
+    private func fileExtLabel(_ name: String?) -> String {
+        guard let name = name, let dot = name.lastIndex(of: ".") else { return "" }
+        let ext = name[name.index(after: dot)...].uppercased()
+        return "\(ext) 文件"
+    }
+
+    private func wechatFileIcon(_ name: String?) -> String {
+        guard let name = name, let dot = name.lastIndex(of: ".") else { return "doc.fill" }
+        let ext = name[name.index(after: dot)...].lowercased()
+        switch ext {
+        case "doc", "docx": return "doc.richtext.fill"
+        case "pdf": return "doc.text.fill"
+        case "xls", "xlsx": return "tablecells.fill"
+        case "ppt", "pptx": return "rectangle.split.3x1.fill"
+        case "zip", "rar", "7z": return "doc.zipper"
+        default: return "doc.fill"
+        }
     }
 }
 
@@ -4899,7 +5061,7 @@ private struct ChatMessageListRow: View {
 
     var body: some View {
         if ThemeStore.shared.theme == .wechat {
-            WeChatBubbleRow(message: message, showTime: showTime)
+            WeChatBubbleRow(message: message, showTime: showTime, onImageTap: onImageTap)
         } else {
             standardRow
         }
