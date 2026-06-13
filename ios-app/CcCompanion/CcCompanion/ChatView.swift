@@ -3016,7 +3016,8 @@ struct ChatView: View {
                 )
             }
             // 2026-05-14 build 194 — 同步历史进度浮条 (running / done 状态短暂显示)
-            if let progress = vm.backfillProgress {
+            // v2.1 微信伪装: 同步进度条属 AI-app 元素, 微信主题下隐掉防出戏.
+            if ThemeStore.shared.theme != .wechat, let progress = vm.backfillProgress {
                 BackfillProgressBar(state: progress)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
@@ -4026,10 +4027,17 @@ private struct WeChatHeaderBar: View {
 
     var body: some View {
         ZStack {
-            HStack {
+            HStack(spacing: 6) {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 18, weight: .medium))
                     .foregroundStyle(Color(red: 0.094, green: 0.094, blue: 0.094))
+                // v2.1 微信伪装: 返回箭头旁未读数胶囊 (对照真微信 "< 2035" 样式). 静态伪装数, 不要可删整段.
+                Text("128")
+                    .font(.system(size: 14))
+                    .foregroundStyle(Color(red: 0.42, green: 0.42, blue: 0.42))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 1.5)
+                    .background(Capsule().fill(Color(red: 0.85, green: 0.85, blue: 0.85)))
                 Spacer()
             }
             Text(aiName)
@@ -4997,20 +5005,21 @@ private struct WeChatBubbleRow: View {
     }
 
     private var textBubble: some View {
+        // v2.1 微信精修: 字号 16->17 (微信正文标准), padding 加厚 (10/8 -> 12/9), 圆角 4->5, 气泡更饱满贴真微信.
         Text(message.text.isEmpty ? " " : message.text)
-            .font(.system(size: 16))
+            .font(.system(size: 17))
             .foregroundStyle(Color(red: 0.094, green: 0.094, blue: 0.094))
             .textSelection(.enabled)
-            .padding(.horizontal, 10).padding(.vertical, 8)
+            .padding(.horizontal, 12).padding(.vertical, 9)
             .background(
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
                     .fill(isUser ? Color.ccUser : Color.ccAssistant)
             )
             .overlay(alignment: isUser ? .topTrailing : .topLeading) {
                 WeChatTailTriangle(pointingRight: isUser)
                     .fill(isUser ? Color.ccUser : Color.ccAssistant)
                     .frame(width: 6, height: 10)
-                    .offset(x: isUser ? 5 : -5, y: 10)
+                    .offset(x: isUser ? 5 : -5, y: 11)
             }
     }
 
