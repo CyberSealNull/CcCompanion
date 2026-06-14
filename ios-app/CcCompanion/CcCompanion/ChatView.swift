@@ -2940,7 +2940,12 @@ struct ChatView: View {
                     onExit: { ThemeStore.shared.theme = .warm },
                     onToggleSearch: { showSearch.toggle() },
                     onShowFavorites: onShowFavorites,
-                    onClearChat: { showClearChatConfirm = true }
+                    onClearChat: { showClearChatConfirm = true },
+                    multiSelectMode: vm.multiSelectMode,
+                    selectedCount: vm.selectedTs.count,
+                    totalCount: vm.selectableDisplayedMessages.count,
+                    onToggleAll: toggleAllDisplayedSelection,
+                    onExitMultiSelect: { vm.exitMultiSelect() }
                 )
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
@@ -4035,10 +4040,38 @@ private struct WeChatHeaderBar: View {
     var onToggleSearch: () -> Void = {}
     var onShowFavorites: (() -> Void)? = nil
     var onClearChat: (() -> Void)? = nil
+    // v2.4 任务2: 多选态头栏 (全选/取消全选 + 已选 N 条 + 完成). 微信主题也要能在顶栏进退多选.
+    var multiSelectMode: Bool = false
+    var selectedCount: Int = 0
+    var totalCount: Int = 0
+    var onToggleAll: () -> Void = {}
+    var onExitMultiSelect: () -> Void = {}
 
     private let inkColor = Color(red: 0.094, green: 0.094, blue: 0.094)
+    private var allSelected: Bool { totalCount > 0 && selectedCount == totalCount }
 
     var body: some View {
+        if multiSelectMode {
+            // v2.4 任务2: 多选态 — 左"全选/取消全选" 中"已选 N 条" 右"完成"(退出多选).
+            HStack {
+                Button(allSelected ? "取消全选" : "全选", action: onToggleAll)
+                    .font(.system(size: 16))
+                    .foregroundStyle(inkColor)
+                Spacer()
+                Text("已选 \(selectedCount) 条")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(inkColor)
+                Spacer()
+                Button("完成", action: onExitMultiSelect)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(inkColor)
+            }
+        } else {
+            normalHeader
+        }
+    }
+
+    private var normalHeader: some View {
         ZStack {
             HStack(spacing: 6) {
                 // v2.2 任务5: 左上返回箭头 = 退出伪装出口, 点它切回暖橙主题. 任务4: 去掉原写死未读数 128 胶囊, 只留干净箭头.
@@ -5113,14 +5146,35 @@ private struct ChatMessageListRow: View {
 
     var body: some View {
         if ThemeStore.shared.theme == .wechat {
-            // v2.2 任务7: 微信主题别砍长按菜单, 把跟其它主题一致的长按气泡菜单原样挂到伪装行上.
-            WeChatBubbleRow(message: message, showTime: showTime, onImageTap: onImageTap)
-            #if !targetEnvironment(macCatalyst)
-                .contextMenu { messageContextMenu }
-            #endif
+            wechatRow
         } else {
             standardRow
         }
+    }
+
+    // v2.4 任务2: 微信主题多选 UI 做全. v2.2 只挂了长按菜单(含"选择多条")但没补 iOS 端勾选/点选 UI,
+    // 进多选后点不动 (老 TODO 在 standardRow:5196). 这里镜像 standardRow 的勾选框 + tap-toggle, 复用同一份
+    // multiSelectMode/selected/onToggleSelection (数据层 selectedMessages 不动). 勾选圈用微信绿贴真微信样式.
+    private var wechatRow: some View {
+        HStack(spacing: 8) {
+            if multiSelectMode {
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 22))
+                    .foregroundStyle(selected ? Color(red: 0.027, green: 0.756, blue: 0.376) : Color(red: 0.7, green: 0.7, blue: 0.7))
+                    .padding(.leading, 12)
+            }
+            // v2.2 任务7: 微信主题别砍长按菜单, 把跟其它主题一致的长按气泡菜单原样挂到伪装行上.
+            WeChatBubbleRow(message: message, showTime: showTime, onImageTap: onImageTap)
+        }
+        #if !targetEnvironment(macCatalyst)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if multiSelectMode {
+                onToggleSelection()
+            }
+        }
+        .contextMenu { messageContextMenu }
+        #endif
     }
 
     // v2.2: 长按气泡菜单内容抽成单一来源, 微信主题(任务7)跟其它主题共用, 菜单项原样一致.

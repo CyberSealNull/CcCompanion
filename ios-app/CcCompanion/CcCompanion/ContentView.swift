@@ -118,6 +118,12 @@ struct ContentView: View {
         // T2 2026-05-12 — single source of truth in ThemeStore.preferredColorScheme.
         // terminal/night force dark; warm honors followSystemColorScheme + schemePref.
         .preferredColorScheme(theme.preferredColorScheme)
+        // v2.4 P1 修: 从设置页(case2)等非聊天 tab 切到微信主题, v2.3 把 tab 栏换成 EmptyView 后用户卡在当前页无出口(返回箭头只在 ChatView 的 WeChatHeaderBar, 当前路径不渲染它). 进 .wechat 时同步回聊天 tab, 落在带返回箭头的聊天页; 切回其它主题 FloatingTabBar 自然恢复 selectedTab 不动.
+        .onChange(of: theme.theme) { _, newTheme in
+            if newTheme == .wechat {
+                selectedTab = 0
+            }
+        }
         // Phase E 2026-05-11 — cccompanion build 也要能弹 FavoritesView
         .sheet(isPresented: $showFavorites) {
             NavigationStack { FavoritesView() }
