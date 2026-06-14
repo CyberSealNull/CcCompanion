@@ -62,7 +62,8 @@ struct CcAvatarView: View {
 
     var body: some View {
         ZStack {
-            Circle().fill(Color.ccCard)
+            // v2.5: 底层背景同步跟主题切方/圆(防头像图没填满时露出旧圆底), 跟外层 clipShape 同一套圆角逻辑
+            RoundedRectangle(cornerRadius: theme.theme == .wechat ? 2 : size / 2, style: .continuous).fill(Color.ccCard)
             if !path.isEmpty, let uiImage = AvatarDiskStore.load(storedValue: path) {
                 Image(uiImage: uiImage)
                     .resizable()
@@ -81,9 +82,10 @@ struct CcAvatarView: View {
         .frame(width: size, height: size)
         // v2.2 真机精修: 头像圆角 5->2, 更方更贴真微信近直角方头像 (不是纯 0pt 直角, 留极小圆角). 仅 .wechat 主题, 其它主题仍 Circle 零回归.
         // v2.3 BUG 修: 改用 observe 的 theme.theme (上面 @ObservedObject), 运行时切主题能重算成方/圆.
-        .clipShape(theme.theme == .wechat
-            ? AnyShape(RoundedRectangle(cornerRadius: 2, style: .continuous))
-            : AnyShape(Circle()))
+        // v2.5 BUG 根治: 原来用 AnyShape 三元(类型擦除 Circle/RoundedRectangle), SwiftUI 运行时切主题
+        // diff 不出 shape 变化, 头像卡在启动时形状(真机从别主题切进来一直圆; simulator 冷启直接 wechat
+        // 才假方). 改成统一 RoundedRectangle, 圆角值在 2(方)和 size/2(圆)间切, 类型不变 SwiftUI 能 diff 能更新.
+        .clipShape(RoundedRectangle(cornerRadius: theme.theme == .wechat ? 2 : size / 2, style: .continuous))
         .id("\(role == .ai ? "ai" : "user")-\(AvatarDiskStore.filename(fromStoredValue: path))")
     }
 }
@@ -219,7 +221,7 @@ struct AvatarCropView: View {
                 .mask(
                     Rectangle()
                         .overlay(
-                            Circle()
+                            RoundedRectangle(cornerRadius: cropDiameter * 0.05, style: .continuous)
                                 .frame(width: cropDiameter, height: cropDiameter)
                                 .blendMode(.destinationOut)
                         )
@@ -228,8 +230,8 @@ struct AvatarCropView: View {
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
-            // Circular frame outline
-            Circle()
+            // v2.5: 方形取景框(贴微信方头像), 跟存方图 + 显示 clipShape 一致
+            RoundedRectangle(cornerRadius: cropDiameter * 0.05, style: .continuous)
                 .stroke(Color.white.opacity(0.9), lineWidth: 1.5)
                 .frame(width: cropDiameter, height: cropDiameter)
                 .allowsHitTesting(false)
@@ -291,8 +293,9 @@ struct AvatarCropView: View {
         let square = UIImage(cgImage: croppedCG, scale: outputScale, orientation: full.imageOrientation)
         let finalSide: CGFloat = 512
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: finalSide, height: finalSide))
+        // v2.5 BUG 根治: 原来 ovalIn addClip 把方形 crop 又裁成圆才存盘, 图数据永远圆, 框方了也露圆图.
+        // 改成直接存方图, 显示形状全交给 CcAvatarView 的 clipShape 控制(微信方 / 其它圆), 一份方图两主题都对.
         return renderer.image { _ in
-            UIBezierPath(ovalIn: CGRect(x: 0, y: 0, width: finalSide, height: finalSide)).addClip()
             square.draw(in: CGRect(x: 0, y: 0, width: finalSide, height: finalSide))
         }
     }
