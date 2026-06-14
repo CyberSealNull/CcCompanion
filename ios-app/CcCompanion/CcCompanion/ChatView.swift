@@ -4671,7 +4671,7 @@ private struct ChatSeparatorRow: View {
             Spacer()
             Text(label)
                 .font(themeStore.theme == .wechat
-                    ? .system(size: 12)
+                    ? .system(size: 14)   // v2.3 任务4: 微信分隔行(day/30min)时间戳字号 12->14 贴真微信; 其它主题 11 零回归.
                     : .ccSerifAdaptive(size: 11))
                 .foregroundStyle(themeStore.theme == .wechat
                     ? Color(red: 0.6, green: 0.6, blue: 0.6)
@@ -4684,7 +4684,10 @@ private struct ChatSeparatorRow: View {
                 .clipShape(Capsule())
             Spacer()
         }
-        .padding(EdgeInsets(top: 8, leading: 12, bottom: 4, trailing: 12))
+        // v2.3 任务5: 微信分隔行上下 padding 加大 (top8/bottom4 -> top16/bottom14) 给时间戳呼吸感; 其它主题保持原值零回归.
+        .padding(themeStore.theme == .wechat
+            ? EdgeInsets(top: 16, leading: 12, bottom: 14, trailing: 12)
+            : EdgeInsets(top: 8, leading: 12, bottom: 4, trailing: 12))
     }
 }
 
@@ -4968,17 +4971,19 @@ private struct WeChatBubbleRow: View {
     var body: some View {
         VStack(spacing: 2) {
             if showTime, !wechatTimeText.isEmpty {
+                // v2.3 任务4/5: 微信 per-message 时间戳字号 12->14, 上下 padding 6->10 给呼吸感 (WeChatBubbleRow 只在 wechat 渲染, 天然门控).
                 Text(wechatTimeText)
-                    .font(.system(size: 12))
+                    .font(.system(size: 14))
                     .foregroundStyle(Color(red: 0.6, green: 0.6, blue: 0.6))
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
+                    .padding(.vertical, 10)
             }
-            // v2.2 真机精修(任务2): 头像与气泡间距 3->8, 让气泡小尖尖(向外探 5pt)与头像之间留出约 3pt 缝, 不再紧贴头像.
+            // v2.2 真机精修: 头像与气泡间距 3->8, 让气泡小尖尖(向外探 5pt)与头像之间留出约 3pt 缝, 不再紧贴头像.
+            // v2.3 任务2: 对侧 Spacer minLength 60->40, 文字气泡可伸到约 72% 屏宽 (iPhone17Pro ~281pt) 贴真微信宽气泡.
             HStack(alignment: .top, spacing: 8) {
-                if isUser { Spacer(minLength: 60) } else { CcAvatarView(role: .ai, size: 40) }
+                if isUser { Spacer(minLength: 40) } else { CcAvatarView(role: .ai, size: 40) }
                 bubbleContent
-                if isUser { CcAvatarView(role: .user, size: 40) } else { Spacer(minLength: 60) }
+                if isUser { CcAvatarView(role: .user, size: 40) } else { Spacer(minLength: 40) }
             }
             .padding(.horizontal, 12)
         }
@@ -4986,23 +4991,34 @@ private struct WeChatBubbleRow: View {
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
     }
 
+    private var hasBubbleText: Bool {
+        !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     @ViewBuilder
     private var bubbleContent: some View {
         if let url = message.attachmentFullURL() {
-            if message.attachmentType == "image" {
-                CachedImage(url: url) { img in
-                    img.resizable()
-                        .scaledToFit()
-                        .frame(maxWidth: 200, maxHeight: 200)
-                        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                } placeholder: {
-                    ProgressView()
-                        .frame(width: 120, height: 90)
+            // v2.3 BUG 修(任务6): 图文/文件+文字混合消息, 原来 if attachment 就只画附件, text 半边被 else 吞掉漏渲染.
+            // 改成附件 + 文字气泡上下都渲染 (VStack 按发送方对齐), 跟真微信图文同条都显示一致. 仅 wechat 路径 (WeChatBubbleRow), 不动 standard.
+            VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
+                if message.attachmentType == "image" {
+                    CachedImage(url: url) { img in
+                        img.resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: 220, maxHeight: 220)
+                            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                    } placeholder: {
+                        ProgressView()
+                            .frame(width: 120, height: 90)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { onImageTap?(url) }
+                } else {
+                    wechatFileCard
                 }
-                .contentShape(Rectangle())
-                .onTapGesture { onImageTap?(url) }
-            } else {
-                wechatFileCard
+                if hasBubbleText {
+                    textBubble
+                }
             }
         } else {
             textBubble
@@ -5026,7 +5042,7 @@ private struct WeChatBubbleRow: View {
                 .foregroundStyle(Color(red: 0.35, green: 0.55, blue: 0.85))
         }
         .padding(12)
-        .frame(maxWidth: 220)
+        .frame(maxWidth: 280)   // v2.3 任务2: 文件卡片气泡宽度 220->280 贴真微信
         .background(Color.white)
         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
     }

@@ -105,7 +105,8 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             if theme.theme == .wechat {
-                WeChatTabBar(items: tabs, selection: $selectedTab)
+                // v2.3 任务3: 微信主题完全不渲染任何 tab (连 WeChatTabBar 也撤掉), 纯聊天页伪装. 出戏靠左上角返回箭头(v2.2 onExit→.warm), 切回正常主题后 FloatingTabBar 自然恢复.
+                EmptyView()
             } else {
                 FloatingTabBar(items: tabs, selection: $selectedTab)
                     .ignoresSafeArea(.keyboard, edges: .bottom)

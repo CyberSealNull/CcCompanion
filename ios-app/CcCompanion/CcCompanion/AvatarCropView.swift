@@ -50,6 +50,8 @@ struct CcAvatarView: View {
     let role: CcIdentityRole
     let size: CGFloat
 
+    // v2.3 BUG 修: observe ThemeStore, 否则运行时切到 .wechat 时本 view 不重算 clipShape (配合下面 .id 钉死身份), 头像卡在首次算的 Circle 不变方. 同 6483669 字体串主题 bug 一族 (静态读单例无失效依赖).
+    @ObservedObject private var theme = ThemeStore.shared
     @AppStorage("ai_avatar_emoji") private var aiAvatarEmoji: String = "🦀"
     @AppStorage("ai_avatar_path") private var aiAvatarPath: String = ""
     @AppStorage("user_avatar_path") private var userAvatarPath: String = ""
@@ -78,7 +80,8 @@ struct CcAvatarView: View {
         }
         .frame(width: size, height: size)
         // v2.2 真机精修: 头像圆角 5->2, 更方更贴真微信近直角方头像 (不是纯 0pt 直角, 留极小圆角). 仅 .wechat 主题, 其它主题仍 Circle 零回归.
-        .clipShape(ThemeStore.shared.theme == .wechat
+        // v2.3 BUG 修: 改用 observe 的 theme.theme (上面 @ObservedObject), 运行时切主题能重算成方/圆.
+        .clipShape(theme.theme == .wechat
             ? AnyShape(RoundedRectangle(cornerRadius: 2, style: .continuous))
             : AnyShape(Circle()))
         .id("\(role == .ai ? "ai" : "user")-\(AvatarDiskStore.filename(fromStoredValue: path))")
