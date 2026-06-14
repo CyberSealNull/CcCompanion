@@ -77,8 +77,9 @@ struct CcAvatarView: View {
             }
         }
         .frame(width: size, height: size)
+        // v2.2 真机精修: 头像圆角 5->2, 更方更贴真微信近直角方头像 (不是纯 0pt 直角, 留极小圆角). 仅 .wechat 主题, 其它主题仍 Circle 零回归.
         .clipShape(ThemeStore.shared.theme == .wechat
-            ? AnyShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+            ? AnyShape(RoundedRectangle(cornerRadius: 2, style: .continuous))
             : AnyShape(Circle()))
         .id("\(role == .ai ? "ai" : "user")-\(AvatarDiskStore.filename(fromStoredValue: path))")
     }

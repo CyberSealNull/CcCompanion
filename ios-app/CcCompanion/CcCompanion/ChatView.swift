@@ -2927,14 +2927,21 @@ struct ChatView: View {
             )
             .id(msg.id)
             .padding(.vertical, 4)
-            .padding(.trailing, 12)
+            // v2.2 真机精修(任务3): 微信主题下去掉右侧 12pt 行内边距, 让 user 侧头像与 AI 侧头像两边对称 (各靠 WeChatBubbleRow 内部 12pt). 其它主题保持 12pt 零回归.
+            .padding(.trailing, ThemeStore.shared.theme == .wechat ? 0 : 12)
         }
     }
 
     var body: some View {
         VStack(spacing: 0) {
             if ThemeStore.shared.theme == .wechat {
-                WeChatHeaderBar(aiName: aiName)
+                WeChatHeaderBar(
+                    aiName: aiName,
+                    onExit: { ThemeStore.shared.theme = .warm },
+                    onToggleSearch: { showSearch.toggle() },
+                    onShowFavorites: onShowFavorites,
+                    onClearChat: { showClearChatConfirm = true }
+                )
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                     .background(Color(red: 0.937, green: 0.937, blue: 0.937))
@@ -4023,35 +4030,52 @@ private struct ChatToolbarTrailing: View {
 
 private struct WeChatHeaderBar: View {
     let aiName: String
-    @ObservedObject private var theme = ThemeStore.shared
+    // v2.2 真机精修: 出戏口从右上「···」挪到左上返回箭头(任务5), 「···」恢复成正常微信式弹菜单(任务6).
+    var onExit: () -> Void = {}
+    var onToggleSearch: () -> Void = {}
+    var onShowFavorites: (() -> Void)? = nil
+    var onClearChat: (() -> Void)? = nil
+
+    private let inkColor = Color(red: 0.094, green: 0.094, blue: 0.094)
 
     var body: some View {
         ZStack {
             HStack(spacing: 6) {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(Color(red: 0.094, green: 0.094, blue: 0.094))
-                // v2.1 微信伪装: 返回箭头旁未读数胶囊 (对照真微信 "< 2035" 样式). 静态伪装数, 不要可删整段.
-                Text("128")
-                    .font(.system(size: 14))
-                    .foregroundStyle(Color(red: 0.42, green: 0.42, blue: 0.42))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 1.5)
-                    .background(Capsule().fill(Color(red: 0.85, green: 0.85, blue: 0.85)))
+                // v2.2 任务5: 左上返回箭头 = 退出伪装出口, 点它切回暖橙主题. 任务4: 去掉原写死未读数 128 胶囊, 只留干净箭头.
+                Button(action: onExit) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(inkColor)
+                }
+                .accessibilityLabel("返回")
                 Spacer()
             }
             Text(aiName)
                 .font(.system(size: 17, weight: .medium))
-                .foregroundStyle(Color(red: 0.094, green: 0.094, blue: 0.094))
+                .foregroundStyle(inkColor)
             HStack {
                 Spacer()
-                Button {
-                    theme.theme = .warm
+                // v2.2 任务6: 右上「···」改弹菜单, 照搬其它主题顶栏那套动作 (搜索聊天记录 / 收藏 / 清空), 不再单点切主题.
+                Menu {
+                    Button(action: onToggleSearch) {
+                        Label("搜索聊天记录", systemImage: "magnifyingglass")
+                    }
+                    if let fav = onShowFavorites {
+                        Button(action: fav) {
+                            Label("收藏", systemImage: "bookmark")
+                        }
+                    }
+                    if let clear = onClearChat {
+                        Button(role: .destructive, action: clear) {
+                            Label("清空本地聊天", systemImage: "trash")
+                        }
+                    }
                 } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 20, weight: .medium))
-                        .foregroundStyle(Color(red: 0.094, green: 0.094, blue: 0.094))
+                        .foregroundStyle(inkColor)
                 }
+                .accessibilityLabel("更多")
             }
         }
     }
@@ -4950,7 +4974,8 @@ private struct WeChatBubbleRow: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
             }
-            HStack(alignment: .top, spacing: 3) {
+            // v2.2 真机精修(任务2): 头像与气泡间距 3->8, 让气泡小尖尖(向外探 5pt)与头像之间留出约 3pt 缝, 不再紧贴头像.
+            HStack(alignment: .top, spacing: 8) {
                 if isUser { Spacer(minLength: 60) } else { CcAvatarView(role: .ai, size: 40) }
                 bubbleContent
                 if isUser { CcAvatarView(role: .user, size: 40) } else { Spacer(minLength: 60) }
@@ -5072,9 +5097,60 @@ private struct ChatMessageListRow: View {
 
     var body: some View {
         if ThemeStore.shared.theme == .wechat {
+            // v2.2 任务7: 微信主题别砍长按菜单, 把跟其它主题一致的长按气泡菜单原样挂到伪装行上.
             WeChatBubbleRow(message: message, showTime: showTime, onImageTap: onImageTap)
+            #if !targetEnvironment(macCatalyst)
+                .contextMenu { messageContextMenu }
+            #endif
         } else {
             standardRow
+        }
+    }
+
+    // v2.2: 长按气泡菜单内容抽成单一来源, 微信主题(任务7)跟其它主题共用, 菜单项原样一致.
+    @ViewBuilder
+    private var messageContextMenu: some View {
+        if !multiSelectMode {
+            Button(action: onEnterMultiSelect) {
+                Label("选择多条", systemImage: "checkmark.circle")
+            }
+            Button(action: onQuote) {
+                Label("引用回复", systemImage: "quote.bubble")
+            }
+            if !message.isUser {
+                Button(action: { UIPasteboard.general.string = message.text }) {
+                    Label("复制本条", systemImage: "doc.on.doc")
+                }
+            }
+            // 2026-05-14 build 198 — 翻译选项删 (build 190 加进来 用户 6:33 推删 用不上)
+            // build 129 — 复制整段 已外挂到 bubble 下面 这里 contextMenu 不再重复
+            if !message.isUser, let fn = onRegenerate {
+                Button(action: fn) {
+                    Label("重新说", systemImage: "arrow.clockwise")
+                }
+            }
+            Button(action: onFavorite) {
+                Label("收藏本条", systemImage: "bookmark")
+            }
+            Button(action: onAddTodo) {
+                Label("添加到待办", systemImage: "checklist.checked")
+            }
+            if let enterRP = onEnterRP {
+                Button(action: enterRP) {
+                    Label("进入 RP", systemImage: "theatermasks")
+                }
+            }
+            if let url = message.attachmentFullURL() {
+                ShareLink(
+                    item: url,
+                    preview: SharePreview(message.attachmentFilename ?? "附件")
+                ) {
+                    Label(message.attachmentType == "image" ? "保存图片 / 分享" : "保存 / 分享", systemImage: "square.and.arrow.down")
+                }
+            }
+            Button(role: .destructive, action: onDelete) {
+                Label("删除", systemImage: "trash")
+            }
         }
     }
 
@@ -5114,50 +5190,7 @@ private struct ChatMessageListRow: View {
         // iPhone 端保留 长按出大菜单 是主要交互路径
         // Mac 端关掉外层 优先选词 大菜单后续走 hover ⋯ 入口补回 (TODO 下 spec)
         #if !targetEnvironment(macCatalyst)
-        .contextMenu {
-            if !multiSelectMode {
-                Button(action: onEnterMultiSelect) {
-                    Label("选择多条", systemImage: "checkmark.circle")
-                }
-                Button(action: onQuote) {
-                    Label("引用回复", systemImage: "quote.bubble")
-                }
-                if !message.isUser {
-                    Button(action: { UIPasteboard.general.string = message.text }) {
-                        Label("复制本条", systemImage: "doc.on.doc")
-                    }
-                }
-                // 2026-05-14 build 198 — 翻译选项删 (build 190 加进来 用户 6:33 推删 用不上)
-                // build 129 — 复制整段 已外挂到 bubble 下面 这里 contextMenu 不再重复
-                if !message.isUser, let fn = onRegenerate {
-                    Button(action: fn) {
-                        Label("重新说", systemImage: "arrow.clockwise")
-                    }
-                }
-                Button(action: onFavorite) {
-                    Label("收藏本条", systemImage: "bookmark")
-                }
-                Button(action: onAddTodo) {
-                    Label("添加到待办", systemImage: "checklist.checked")
-                }
-                if let enterRP = onEnterRP {
-                    Button(action: enterRP) {
-                        Label("进入 RP", systemImage: "theatermasks")
-                    }
-                }
-                if let url = message.attachmentFullURL() {
-                    ShareLink(
-                        item: url,
-                        preview: SharePreview(message.attachmentFilename ?? "附件")
-                    ) {
-                        Label(message.attachmentType == "image" ? "保存图片 / 分享" : "保存 / 分享", systemImage: "square.and.arrow.down")
-                    }
-                }
-                Button(role: .destructive, action: onDelete) {
-                    Label("删除", systemImage: "trash")
-                }
-            }
-        }
+        .contextMenu { messageContextMenu }
         #endif
     }
 }
