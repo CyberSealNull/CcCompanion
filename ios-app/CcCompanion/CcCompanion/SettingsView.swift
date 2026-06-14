@@ -572,6 +572,9 @@ struct CcSettingsView: View {
     // Phase E (item 7) — 聊天背景 disk path. 空字符串 = 走主题 bg color.
     @AppStorage("chat_background_path") private var chatBackgroundPath: String = ""
 
+    // v2.6 拍一拍后缀 (微信主题双击对方头像). 默认空, 填了拼到「我拍了拍 "名称"」后面 (像微信「的脑袋」).
+    @AppStorage("patpat_suffix") private var patpatSuffix: String = ""
+
     @State private var actionToast: String = ""
     @State private var showHapticInfo: Bool = false
     // Build 215 S2 — 群聊编辑 sheet 状态
@@ -711,6 +714,21 @@ struct CcSettingsView: View {
                         .pickerStyle(.segmented)
                         .padding(.vertical, 4)
                     }
+
+                    // v2.6 拍一拍后缀: 微信主题双击对方头像后「我拍了拍 "名称"」拼这个后缀.
+                    // 不 gate 微信主题显示 — 微信主题隐藏了 tab 到不了设置页, 后缀必须在其它主题可设 (设了存 AppStorage, 切微信主题生效).
+                    HStack {
+                        Text("拍一拍后缀")
+                            .font(.ccSerifAdaptive(size: 15))
+                            .foregroundStyle(Color.ccText)
+                        Spacer()
+                        TextField("如 的脑袋", text: $patpatSuffix)
+                            .multilineTextAlignment(.trailing)
+                            .font(.ccSerifAdaptive(size: 15))
+                            .foregroundStyle(Color.ccTextDim)
+                            .frame(maxWidth: 160)
+                    }
+                    .padding(.vertical, 4)
                 }
 
                 // 终端 session 顺序 (build226) — 拖动自定义终端 tab 的 session 排序

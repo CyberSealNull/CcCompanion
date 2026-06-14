@@ -662,6 +662,8 @@ final class ChatViewModel: ObservableObject {
     @Published var loadingEarlier: Bool = false
     @Published var hasMoreEarlier: Bool = true
     @Published var uploadQueue: [PendingUpload] = []
+    // v2.6 拍一拍: 本地系统消息事件 (非真消息, 仅微信主题渲染成居中灰字, rebuild 时按时间合并进 rows).
+    @Published var patpatEvents: [PatPatEvent] = []
     @Published private(set) var displayedRowsCache: [ChatRowItem] = []
     // Phase 3 (thinking-stream-render): turn_id → 拉到的 thinking 文本. ThinkingChip 读这里.
     @Published private(set) var thinkingByTurn: [String: String] = [:]
@@ -840,13 +842,25 @@ final class ChatViewModel: ObservableObject {
 
     private func rebuildDisplayedRowsCache() {
         let start = CFAbsoluteTimeGetCurrent()
-        let msgs = displayedMessages.filter { $0.role != "move" }
+        // v2.6 拍一拍: 过滤掉发给对方的 ping 信号 (不当用户气泡显示, 全主题都隐 — 该前缀消息只由拍一拍功能产生, 非回归).
+        let msgs = displayedMessages.filter { $0.role != "move" && !isPatPatPing($0) }
         var out: [ChatRowItem] = []
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var lastDate: Date? = nil
         let showTimeById = makeShowTimeById(formatter: formatter)
         var taskBuffer: [ChatMessage] = []
+        // v2.6 拍一拍: 仅微信主题把本地拍一拍系统消息按时间合并进 rows (渲染成居中灰字 .separator). 其它主题不合并=零回归.
+        let patpatActive = ThemeStore.shared.theme == .wechat
+        let sortedPatpats = patpatActive ? patpatEvents.sorted { $0.date < $1.date } : []
+        var patpatIdx = 0
+        func emitPatpats(upTo date: Date?) {
+            guard let date = date else { return }
+            while patpatIdx < sortedPatpats.count, sortedPatpats[patpatIdx].date <= date {
+                out.append(.separator(label: sortedPatpats[patpatIdx].text, id: sortedPatpats[patpatIdx].id))
+                patpatIdx += 1
+            }
+        }
 
         func flushTaskBuffer() {
             guard !taskBuffer.isEmpty else { return }
@@ -863,6 +877,8 @@ final class ChatViewModel: ObservableObject {
         }
 
         for msg in msgs {
+            // v2.6 拍一拍: 在本条消息之前先吐出时间 <= 本条的拍一拍系统消息, 保证时间序.
+            emitPatpats(upTo: Self.parseChatDate(msg.ts, formatter: formatter))
             if msg.role == "task" {
                 // separator 仍然按 task 时间插 (对第一条 task)
                 if taskBuffer.isEmpty {
@@ -901,6 +917,11 @@ final class ChatViewModel: ObservableObject {
             if let cur = cur { lastDate = cur }
         }
         flushTaskBuffer()
+        // v2.6 拍一拍: 比所有消息都新的拍一拍 (刚发生的) 补在末尾.
+        while patpatIdx < sortedPatpats.count {
+            out.append(.separator(label: sortedPatpats[patpatIdx].text, id: sortedPatpats[patpatIdx].id))
+            patpatIdx += 1
+        }
 
         // 最后一组如果是 toolStack 且最近 30s 内仍在跑 标记 isRunning=true
         if let lastIdx = out.indices.last, case .toolStack(let stack) = out[lastIdx] {
@@ -2266,6 +2287,43 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    // MARK: - 拍一拍 (v2.6, 仅微信主题)
+
+    /// 双击对方头像触发: 插一条本地居中灰字系统消息「我拍了拍 "<AI名>"<后缀>」+ 复用现有 /chat/send 发 ping 给对方.
+    /// 多选态不触发 (那时双击头像是 toggle 选中). 仅微信主题 (调用源 WeChatBubbleRow 本就 wechat-only, 这里再 guard 一道).
+    func triggerPatPat() {
+        guard !multiSelectMode, ThemeStore.shared.theme == .wechat else { return }
+        let aiName = CcNameResolver.name(for: .ai)
+        let suffix = UserDefaults.standard.string(forKey: "patpat_suffix") ?? ""
+        let text = "我拍了拍 \"\(aiName)\"\(suffix)"
+        patpatEvents.append(PatPatEvent(id: "patpat_\(UUID().uuidString)", date: Date(), text: text))
+        rebuildDisplayedRowsCache()
+        Task { await sendPatPatPing(suffix: suffix) }
+    }
+
+    /// 发拍一拍 ping 给对方: 复用现有 /chat/send (不改 server/push.py). 静默 fire-and-forget,
+    /// 不走 optimistic 不 append 回包→不在本端冒绿气泡; poll 回来的 ping 由 rebuild 的 isPatPatPing 过滤掉.
+    /// 用户名走 CcNameResolver 运行时取 (源码不硬编码名字, 过脱敏).
+    private func sendPatPatPing(suffix: String) async {
+        let userName = CcNameResolver.name(for: .user)
+        let pingText = "[拍一拍] \(userName)拍了拍你\(suffix)"
+        let url = CcServerConfig.serverURL.appendingPathComponent("chat/send")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let secret = CcServerConfig.sharedSecret, !secret.isEmpty {
+            req.setValue(secret, forHTTPHeaderField: "X-Auth-Token")
+        }
+        req.timeoutInterval = 15
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": pingText])
+        _ = try? await session.data(for: req)
+    }
+
+    /// 拍一拍 ping 是发给对方的信号文本, 不当用户气泡显示 (灰字系统消息已表达). poll 回来时按前缀过滤.
+    private func isPatPatPing(_ m: ChatMessage) -> Bool {
+        m.role == "user" && m.text.hasPrefix("[拍一拍]")
+    }
+
     // MARK: - Optimistic send helpers (2026-05-12)
 
     /// Construct a local-only `ChatMessage` for the optimistic UI insert.
@@ -3300,6 +3358,10 @@ struct ChatView: View {
         }
         .onAppear { vm.start(); vm.reconcileLocalSendState(); Task { await vm.clearUnread() }; vm.restorePendingFailedMessages() }
         .onDisappear { vm.stop() }
+        // v2.6 拍一拍: 微信主题双击对方头像 (WeChatBubbleRow post .ccPatPat) → 插系统消息 + 发 ping 给对方. vm.triggerPatPat 内 guard 多选态/非微信主题.
+        .onReceive(NotificationCenter.default.publisher(for: .ccPatPat)) { _ in
+            vm.triggerPatPat()
+        }
         .onChange(of: scenePhase) { _, phase in
             vm.setPollingActive(phase == .active)
             if phase == .active {
@@ -4967,11 +5029,36 @@ private struct WeChatTailTriangle: Shape {
     }
 }
 
+// MARK: - 拍一拍 (v2.6, 仅微信主题)
+
+extension Notification.Name {
+    /// 微信主题双击对方头像触发拍一拍. WeChatBubbleRow 头像 post, ChatView .onReceive → vm.triggerPatPat().
+    static let ccPatPat = Notification.Name("ccPatPat")
+}
+
+/// 拍一拍本地系统消息事件 (非真消息, 不入 server, 仅客户端装饰渲染成居中灰字).
+struct PatPatEvent: Identifiable, Hashable {
+    let id: String
+    let date: Date
+    let text: String
+}
+
+/// 头像抖动 GeometryEffect — animatableData 0→1 时水平 sin 摆动 3 个来回 (拍一拍那种 jiggle).
+private struct PatShakeEffect: GeometryEffect {
+    var animatableData: CGFloat
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        let dx = 5 * sin(animatableData * .pi * 3)
+        return ProjectionTransform(CGAffineTransform(translationX: dx, y: 0))
+    }
+}
+
 private struct WeChatBubbleRow: View {
     let message: ChatMessage
     let showTime: Bool
     var onImageTap: ((URL) -> Void)? = nil
     private var isUser: Bool { message.isUser }
+    // v2.6 拍一拍: 双击 AI 头像的抖动量, 0→1 触发一轮 jiggle.
+    @State private var patShake: CGFloat = 0
 
     private static let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
@@ -5014,7 +5101,7 @@ private struct WeChatBubbleRow: View {
             // v2.2 真机精修: 头像与气泡间距 3->8, 让气泡小尖尖(向外探 5pt)与头像之间留出约 3pt 缝, 不再紧贴头像.
             // v2.3 任务2: 对侧 Spacer minLength 60->40, 文字气泡可伸到约 72% 屏宽 (iPhone17Pro ~281pt) 贴真微信宽气泡.
             HStack(alignment: .top, spacing: 8) {
-                if isUser { Spacer(minLength: 40) } else { CcAvatarView(role: .ai, size: 40) }
+                if isUser { Spacer(minLength: 40) } else { aiAvatar }
                 bubbleContent
                 if isUser { CcAvatarView(role: .user, size: 40) } else { Spacer(minLength: 40) }
             }
@@ -5022,6 +5109,18 @@ private struct WeChatBubbleRow: View {
         }
         .padding(.vertical, showTime ? 4 : 2)
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+    }
+
+    // v2.6 拍一拍: 对方(AI)头像双击触发. 抖动 + haptic 是本地反馈; 系统消息 + 发 ping 给对方 由 vm 接 .ccPatPat 通知做.
+    // 双击只挂头像 view (不挂整行), 避免抢 bubble 单击/长按 hit-test (spec 任务1).
+    private var aiAvatar: some View {
+        CcAvatarView(role: .ai, size: 40)
+            .modifier(PatShakeEffect(animatableData: patShake))
+            .onTapGesture(count: 2) {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                withAnimation(.linear(duration: 0.45)) { patShake += 1 }
+                NotificationCenter.default.post(name: .ccPatPat, object: nil)
+            }
     }
 
     private var hasBubbleText: Bool {
