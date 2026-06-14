@@ -573,12 +573,15 @@ enum ChatRowItem: Identifiable, Hashable {
     case message(ChatMessage, showTime: Bool)
     case separator(label: String, id: String)
     case toolStack(ToolStack)
+    // v2.6 P1 修: 拍一拍本地系统消息独立类型 (不再伪装成 .separator). 渲染层只在 .wechat 画, 非微信 EmptyView, 结构上杜绝切主题泄漏.
+    case patpat(PatPatEvent)
 
     var id: String {
         switch self {
         case .message(let m, _): return m.id
         case .separator(_, let id): return id
         case .toolStack(let s): return "stack_\(s.id)"
+        case .patpat(let e): return e.id
         }
     }
 
@@ -664,6 +667,10 @@ final class ChatViewModel: ObservableObject {
     @Published var uploadQueue: [PendingUpload] = []
     // v2.6 拍一拍: 本地系统消息事件 (非真消息, 仅微信主题渲染成居中灰字, rebuild 时按时间合并进 rows).
     @Published var patpatEvents: [PatPatEvent] = []
+    // v2.6 P2 修: 拍一拍 ping 的 server 规范 id (持久 UserDefaults, 重启仍隐藏不冒绿气泡). isPatPatPing 按 id 精确命中, 不按公开前缀吞.
+    private var hiddenPatPatPingIds: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "patpat_hidden_ids") ?? [])
+    // 网络异常拿不到 id 时的 60s exact-text 兜底 (不永久, 不按前缀).
+    private var recentPatPatPingTexts: [(text: String, at: Date)] = []
     @Published private(set) var displayedRowsCache: [ChatRowItem] = []
     // Phase 3 (thinking-stream-render): turn_id → 拉到的 thinking 文本. ThinkingChip 读这里.
     @Published private(set) var thinkingByTurn: [String: String] = [:]
@@ -857,7 +864,7 @@ final class ChatViewModel: ObservableObject {
         func emitPatpats(upTo date: Date?) {
             guard let date = date else { return }
             while patpatIdx < sortedPatpats.count, sortedPatpats[patpatIdx].date <= date {
-                out.append(.separator(label: sortedPatpats[patpatIdx].text, id: sortedPatpats[patpatIdx].id))
+                out.append(.patpat(sortedPatpats[patpatIdx]))
                 patpatIdx += 1
             }
         }
@@ -919,7 +926,7 @@ final class ChatViewModel: ObservableObject {
         flushTaskBuffer()
         // v2.6 拍一拍: 比所有消息都新的拍一拍 (刚发生的) 补在末尾.
         while patpatIdx < sortedPatpats.count {
-            out.append(.separator(label: sortedPatpats[patpatIdx].text, id: sortedPatpats[patpatIdx].id))
+            out.append(.patpat(sortedPatpats[patpatIdx]))
             patpatIdx += 1
         }
 
@@ -2301,12 +2308,22 @@ final class ChatViewModel: ObservableObject {
         Task { await sendPatPatPing(suffix: suffix) }
     }
 
-    /// 发拍一拍 ping 给对方: 复用现有 /chat/send (不改 server/push.py). 静默 fire-and-forget,
-    /// 不走 optimistic 不 append 回包→不在本端冒绿气泡; poll 回来的 ping 由 rebuild 的 isPatPatPing 过滤掉.
-    /// 用户名走 CcNameResolver 运行时取 (源码不硬编码名字, 过脱敏).
+    /// v2.6 P1: 切主题时公开刷新 rows (执行现有 rebuild). ChatView .onChange(theme) 调它, 重建里 theme-gated merge 非微信不合并拍一拍, 清残留.
+    func rebuildForThemeChange() {
+        rebuildDisplayedRowsCache()
+    }
+
+    /// 发拍一拍 ping 给对方: 复用现有 /chat/send (不改 server/push.py). 静默 fire-and-forget 不走 optimistic 不 append 回包→不在本端冒绿气泡.
+    /// v2.6 P2 修: 解码 /chat/send 返回的 record, 把 server 规范 id 存进 hiddenPatPatPingIds (持久 UserDefaults), poll 回来按 id 精确隐藏;
+    /// 拿不到 id 时记 exact text + 时间作 60s 兜底. 不再按 [拍一拍] 公开前缀吞所有用户消息 (那会误伤用户自己发的同前缀消息).
+    /// 名字走 CcNameResolver 运行时取 (源码不硬编码, 过脱敏).
     private func sendPatPatPing(suffix: String) async {
         let userName = CcNameResolver.name(for: .user)
         let pingText = "[拍一拍] \(userName)拍了拍你\(suffix)"
+        // 先记 exact-text fallback (网络异常拿不到 id 时, 60s 内按精确文本兜底隐藏, 不永久不按前缀).
+        let now = Date()
+        recentPatPatPingTexts.append((text: pingText, at: now))
+        recentPatPatPingTexts.removeAll { now.timeIntervalSince($0.at) > 60 }
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/send")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -2316,12 +2333,24 @@ final class ChatViewModel: ObservableObject {
         }
         req.timeoutInterval = 15
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": pingText])
-        _ = try? await session.data(for: req)
+        if let (data, _) = try? await session.data(for: req),
+           let rec = (try? JSONDecoder().decode(ChatSendResponse.self, from: data))?.record {
+            hiddenPatPatPingIds.insert(rec.id)
+            persistHiddenPatPatPingIds()
+        }
     }
 
-    /// 拍一拍 ping 是发给对方的信号文本, 不当用户气泡显示 (灰字系统消息已表达). poll 回来时按前缀过滤.
+    /// 拍一拍 ping 不当用户气泡显示 (灰字系统消息已表达). v2.6 P2: 优先按 server record id 精确命中隐藏;
+    /// 拿不到 id 时 (网络异常) 用 60s 内 exact-text 兜底. 不按公开前缀吞所有用户消息→用户自己发 [拍一拍]... 不被误藏.
     private func isPatPatPing(_ m: ChatMessage) -> Bool {
-        m.role == "user" && m.text.hasPrefix("[拍一拍]")
+        guard m.role == "user" else { return false }
+        if hiddenPatPatPingIds.contains(m.id) { return true }
+        let now = Date()
+        return recentPatPatPingTexts.contains { $0.text == m.text && now.timeIntervalSince($0.at) < 60 }
+    }
+
+    private func persistHiddenPatPatPingIds() {
+        UserDefaults.standard.set(Array(hiddenPatPatPingIds), forKey: "patpat_hidden_ids")
     }
 
     // MARK: - Optimistic send helpers (2026-05-12)
@@ -2813,6 +2842,8 @@ final class ChatViewModel: ObservableObject {
 struct ChatView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var vm = ChatViewModel()
+    // v2.6 P1 修: observe ThemeStore, 切主题立即重建 rows (清掉拍一拍 separator 残留, 配合 .patpat render-gate 双保险).
+    @ObservedObject private var themeStore = ThemeStore.shared
     @StateObject private var speech = SpeechRecognizer()
     @FocusState private var inputFocused: Bool
     @AppStorage("ai_avatar_emoji") private var aiAvatarEmoji: String = "🦀"
@@ -2947,6 +2978,13 @@ struct ChatView: View {
         case .toolStack(let stack):
             ToolActivityStackView(stack: stack)
                 .id("stack_\(stack.id)")
+        case .patpat(let event):
+            // v2.6 P1 修: 拍一拍系统消息只在微信主题渲染, 其它主题 EmptyView (render-gate, 结构上杜绝切主题泄漏).
+            if ThemeStore.shared.theme == .wechat {
+                ChatSeparatorRow(label: event.text)
+            } else {
+                EmptyView()
+            }
         case .message(let msg, let showTime):
             ChatMessageListRow(
                 message: msg,
@@ -3361,6 +3399,10 @@ struct ChatView: View {
         // v2.6 拍一拍: 微信主题双击对方头像 (WeChatBubbleRow post .ccPatPat) → 插系统消息 + 发 ping 给对方. vm.triggerPatPat 内 guard 多选态/非微信主题.
         .onReceive(NotificationCenter.default.publisher(for: .ccPatPat)) { _ in
             vm.triggerPatPat()
+        }
+        // v2.6 P1 修: 切主题立即重建 rows — 拍一拍 separator 残留在其它主题的泄漏修复 (rebuild 内 theme-gated merge 非微信不合并).
+        .onChange(of: themeStore.theme) { _, _ in
+            vm.rebuildForThemeChange()
         }
         .onChange(of: scenePhase) { _, phase in
             vm.setPollingActive(phase == .active)
@@ -4502,6 +4544,13 @@ private struct ChatListView: View {
                         insertion: .scale(scale: 0.94, anchor: .bottom).combined(with: .opacity),
                         removal: .opacity
                     ))
+            }
+        case .patpat(let event):
+            // v2.6 P1 修: 拍一拍系统消息只在微信主题渲染, 其它主题 EmptyView (render-gate, 结构上杜绝切主题泄漏).
+            if ThemeStore.shared.theme == .wechat {
+                ChatSeparatorRow(label: event.text)
+            } else {
+                EmptyView()
             }
         case .message(let msg, let showTime):
             VStack(alignment: .leading, spacing: 2) {
