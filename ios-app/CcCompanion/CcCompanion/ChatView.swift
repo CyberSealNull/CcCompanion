@@ -323,6 +323,13 @@ nonisolated struct ChatMetadata: Codable, Hashable, Sendable {
     let options: [ChoiceOption]?
 }
 
+// 微信主题 v2.7: 反向拍一拍 payload. server chat 记录里 patpat 字段 {from:"ai", suffix, nick}.
+nonisolated struct PatPatPayload: Codable, Hashable, Sendable {
+    let from: String?
+    let suffix: String?
+    let nick: String?
+}
+
 struct ImagePreview: Identifiable, Sendable {
     let id = UUID()
     let data: Data
@@ -344,6 +351,9 @@ nonisolated struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     let audioJa: String?
     let location: ChatLocation?
     let metadata: ChatMetadata?
+    // 微信主题 v2.7: AI/user 表情包气泡 (sticker_id 在缓存里找 url 渲染成图) + 反向拍一拍 (patpat != nil 产 .patpat 行).
+    var stickerId: String? = nil
+    var patpat: PatPatPayload? = nil
     // Phase 3 (thinking-stream-render): server 给 assistant ios_reply 生成的 turn_id.
     // iOS 用它向 GET /v1/thinking?turn_id=<id> 拉对应 thinking 文本, 对齐到这条 reply.
     // 非 assistant / 旧记录为 nil. 不进 GRDB (transient, 实时 poll 带来).
@@ -367,6 +377,8 @@ nonisolated struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         case audioJa = "audio_ja"
         case location
         case metadata
+        case stickerId = "sticker_id"
+        case patpat
         case turnId = "turn_id"
         case localId = "local_id"
     }
@@ -920,7 +932,15 @@ final class ChatViewModel: ObservableObject {
             if needSep, let cur = cur {
                 out.append(.separator(label: ChatRowItem.formatSeparator(cur), id: "sep_\(msg.ts)"))
             }
-            out.append(.message(msg, showTime: showTimeById[msg.id] ?? true))
+            // v2.7 D: 反向拍一拍 — server chat 记录带 patpat 字段 (AI 拍了用户). 微信主题渲染成居中灰字 .patpat
+            // (nick 用 C 的 live wechat_nick, patpat.nick 作兜底), 非微信主题走普通消息不丢内容.
+            if patpatActive, let pp = msg.patpat {
+                let nick = !WechatNickStore.shared.nick.isEmpty ? WechatNickStore.shared.nick : (pp.nick ?? FlavorConfig.defaultWechatNick)
+                let text = "\(nick)拍了拍我\(pp.suffix ?? "")"
+                out.append(.patpat(PatPatEvent(id: msg.id, date: cur ?? Date(), text: text)))
+            } else {
+                out.append(.message(msg, showTime: showTimeById[msg.id] ?? true))
+            }
             if let cur = cur { lastDate = cur }
         }
         flushTaskBuffer()
@@ -3595,6 +3615,8 @@ private struct ChatInputBar: View {
     @State private var commitPending: Bool = false
     // 2026-05-11 Phase A — slash command popover
     @State private var slashHighlightIndex: Int = 0
+    // v2.7 B — 表情包面板 (所有主题). 表情按钮 → 弹 StickerPickerSheet 发/传表情包.
+    @State private var showStickerPanel = false
 
     private var hasContent: Bool { !draftLocal.isEmpty || !vm.draft.isEmpty || !imagePreviews.isEmpty }
 
@@ -3618,6 +3640,10 @@ private struct ChatInputBar: View {
             inputBarHStack
         }
         .animation(.easeOut(duration: 0.12), value: slashPopoverVisible)
+        .sheet(isPresented: $showStickerPanel) {
+            StickerPickerSheet()
+                .presentationDetents([.medium, .large])
+        }
     }
 
     private var inputBarHStack: some View {
@@ -3668,7 +3694,7 @@ private struct ChatInputBar: View {
                         commitFromSubmit()
                     }
                 }
-            Button { draftLocal += "😊" } label: {
+            Button { showStickerPanel = true } label: {
                 Image(systemName: "face.smiling")
                     .font(.system(size: 22, weight: .medium))
                     .foregroundStyle(Color(red: 0.35, green: 0.35, blue: 0.35))
@@ -3709,6 +3735,14 @@ private struct ChatInputBar: View {
                 onImage()
             } label: {
                 Image(systemName: "photo.fill")
+                    .font(.ccSerifAdaptive(size: 20, weight: .semibold))
+                    .foregroundStyle(Color.ccTextDim)
+            }
+            .disabled(vm.sending)
+
+            // v2.7 B: 表情包入口 (所有主题都带). 弹 StickerPickerSheet 发/传表情包.
+            Button { showStickerPanel = true } label: {
+                Image(systemName: "face.smiling")
                     .font(.ccSerifAdaptive(size: 20, weight: .semibold))
                     .foregroundStyle(Color.ccTextDim)
             }
@@ -4139,6 +4173,8 @@ private struct ChatToolbarTrailing: View {
 
 private struct WeChatHeaderBar: View {
     let aiName: String
+    // v2.7 C: 微信主题顶栏昵称读 /status/wechat_nick (WeChatHeaderBar 只在微信主题用, 天然门控). 拉取前回退 FlavorConfig 默认.
+    @ObservedObject private var nickStore = WechatNickStore.shared
     // v2.2 真机精修: 出戏口从右上「···」挪到左上返回箭头(任务5), 「···」恢复成正常微信式弹菜单(任务6).
     var onExit: () -> Void = {}
     var onToggleSearch: () -> Void = {}
@@ -4187,9 +4223,10 @@ private struct WeChatHeaderBar: View {
                 .accessibilityLabel("返回")
                 Spacer()
             }
-            Text(aiName)
+            Text(nickStore.nick)
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(inkColor)
+                .onAppear { nickStore.refresh() }
             HStack {
                 Spacer()
                 // v2.2 任务6: 右上「···」改弹菜单, 照搬其它主题顶栏那套动作 (搜索聊天记录 / 收藏 / 清空), 不再单点切主题.
@@ -4221,8 +4258,18 @@ private struct WeChatHeaderBar: View {
 private struct QuotePreviewBar: View {
     let message: ChatMessage
     let onClose: () -> Void
+    // v2.7 A3: 微信主题引用预览读 wechat_nick 拼「昵称: 内容」.
+    @ObservedObject private var nickStore = WechatNickStore.shared
 
     var body: some View {
+        if ThemeStore.shared.theme == .wechat {
+            wechatBar
+        } else {
+            standardBar
+        }
+    }
+
+    private var standardBar: some View {
         HStack(spacing: 8) {
             Image(systemName: "quote.bubble")
                 .foregroundStyle(Color.ccAccent)
@@ -4245,6 +4292,27 @@ private struct QuotePreviewBar: View {
         .padding(.vertical, 8)
         .background(Color.ccCard)
         .overlay(Rectangle().frame(width: 2).foregroundStyle(Color.ccAccent), alignment: .leading)
+    }
+
+    // v2.7 A3: 微信式灰底框「被引用人昵称: 内容」, 参照真微信引用预览.
+    private var wechatBar: some View {
+        let quotedNick = message.isUser ? CcNameResolver.name(for: .user) : nickStore.nick
+        return HStack(spacing: 8) {
+            Text("\(quotedNick): \(message.text)")
+                .font(.system(size: 13))
+                .foregroundStyle(Color(red: 0.45, green: 0.45, blue: 0.45))
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            Button(action: onClose) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(Color(red: 0.6, green: 0.6, blue: 0.6))
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color(red: 0.93, green: 0.93, blue: 0.93))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .padding(.horizontal, 8)
     }
 }
 
@@ -4390,14 +4458,19 @@ private struct ChatListView: View {
                 .onScrollGeometryChange(for: Bool.self) { geo in
                     // 距离底部 > 350pt 视为 scrolled up (350 比 200 留足 keyboard 弹起 viewport 收缩的余量)
                     let distanceFromBottom = geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height)
-                    return distanceFromBottom > 350
+                    // v2.7 E scroll 修: typing 期间用更高阈值 (600pt) 区分"用户真往上翻几屏 (几百 pt)"和
+                    // "TypingStatusBar 出现/消失造成的 contentSize 抖动 (几十 pt)". 见下方 action 注释.
+                    let threshold: CGFloat = vm.isCcTyping ? 600 : 350
+                    return distanceFromBottom > threshold
                 } action: { _, scrolledUp in
                     // keyboard 弹起期间不更新 isUserScrolledUp (viewport 收缩会让 distanceFromBottom 自动变大 误判)
                     guard !inputFocused else { return }
-                    // 2026-05-14 build 189 — isCcTyping 切换时 TypingStatusBar 出现/消失会瞬间改变
-                    // contentSize/containerSize, 触发本回调而非用户真滑. 在 typing 状态下跳过更新, 等 typing
-                    // 结束后状态会通过下一次真正滑动 reset.
-                    guard !vm.isCcTyping else { return }
+                    // v2.7 E scroll 修: 原 `guard !vm.isCcTyping else { return }` (2026-05-14 build 189 防
+                    // TypingStatusBar 抖动误判) 把用户在 typing 期间真往上翻历史也一并冻结了 → 工具卡一条条进
+                    // displayedRowsCache 时 isUserScrolledUp 卡在旧值 (false) → 4496 onChange 强制 scrollToBottom
+                    // 把用户钉死在底部翻不上去. 现去掉该 guard, 改用上面的动态阈值: typing 期间 600pt 大阈值,
+                    // TypingStatusBar 几十 pt 抖动到不了 600 不误判 (不回归 5-14 bug), 用户真翻几屏 >600pt 才识别成
+                    // scrolledUp=true, 工具卡就不再拉回 (主诉求). 非 typing 仍走 350pt 阈值零变化.
                     isUserScrolledUp = scrolledUp
                     if !scrolledUp {
                         // 用户回到底部 自动清 unread
@@ -5176,9 +5249,30 @@ private struct WeChatBubbleRow: View {
         !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    // v2.7 A3: 微信引用消息灰底框「被引用人昵称: 内容」. WeChatBubbleRow 只在微信主题渲染, 天然门控.
     @ViewBuilder
     private var bubbleContent: some View {
-        if let url = message.attachmentFullURL() {
+        VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
+            if let q = message.quotedText, !q.isEmpty {
+                Text(q)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Color(red: 0.45, green: 0.45, blue: 0.45))
+                    .lineLimit(3)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .frame(maxWidth: 260, alignment: .leading)
+                    .background(Color(red: 0.93, green: 0.93, blue: 0.93))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            mainBubbleContent
+        }
+    }
+
+    @ViewBuilder
+    private var mainBubbleContent: some View {
+        if let sid = message.stickerId, !sid.isEmpty {
+            // v2.7 B: 表情包气泡渲染成图 (非微信主题/无缓存在 StickerBubbleContent 内降级 desc 文本, 不崩).
+            StickerBubbleContent(stickerId: sid, fallbackText: message.text)
+        } else if let url = message.attachmentFullURL() {
             // v2.3 BUG 修(任务6): 图文/文件+文字混合消息, 原来 if attachment 就只画附件, text 半边被 else 吞掉漏渲染.
             // 改成附件 + 文字气泡上下都渲染 (VStack 按发送方对齐), 跟真微信图文同条都显示一致. 仅 wechat 路径 (WeChatBubbleRow), 不动 standard.
             VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
@@ -6158,6 +6252,10 @@ struct ChatBubble: View {
         HStack(alignment: .bottom, spacing: 0) {
             if message.isUser { Spacer(minLength: 40) }
             VStack(alignment: message.isUser ? .trailing : .leading, spacing: 2) {
+                if let sid = message.stickerId, !sid.isEmpty {
+                    // v2.7 B: 非微信主题表情包渲染 (StickerBubbleContent 内找不到 url 降级 desc 文本, 不崩).
+                    StickerBubbleContent(stickerId: sid, fallbackText: message.text)
+                }
                 if let q = message.quotedText, !q.isEmpty {
                     HStack(spacing: 6) {
                         Rectangle()

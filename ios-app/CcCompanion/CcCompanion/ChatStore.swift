@@ -31,6 +31,8 @@ struct StoredChatMessage: Codable, FetchableRecord, MutablePersistableRecord {
     var audioJa: String?
     var locationJSON: String?
     var metadataJSON: String?
+    var stickerId: String?
+    var patpatJSON: String?
 
     init(message: ChatMessage) {
         self.id = message.id
@@ -49,6 +51,8 @@ struct StoredChatMessage: Codable, FetchableRecord, MutablePersistableRecord {
         self.audioJa = message.audioJa
         self.locationJSON = Self.encode(message.location)
         self.metadataJSON = Self.encode(message.metadata)
+        self.stickerId = message.stickerId
+        self.patpatJSON = Self.encode(message.patpat)
     }
 
     init(row: Row) {
@@ -68,6 +72,8 @@ struct StoredChatMessage: Codable, FetchableRecord, MutablePersistableRecord {
         self.audioJa = row["audioJa"]
         self.locationJSON = row["locationJSON"]
         self.metadataJSON = row["metadataJSON"]
+        self.stickerId = row["stickerId"]
+        self.patpatJSON = row["patpatJSON"]
     }
 
     func chatMessage() -> ChatMessage {
@@ -86,7 +92,9 @@ struct StoredChatMessage: Codable, FetchableRecord, MutablePersistableRecord {
             audioEn: audioEn,
             audioJa: audioJa,
             location: Self.decode(ChatLocation.self, from: locationJSON),
-            metadata: Self.decode(ChatMetadata.self, from: metadataJSON)
+            metadata: Self.decode(ChatMetadata.self, from: metadataJSON),
+            stickerId: stickerId,
+            patpat: Self.decode(PatPatPayload.self, from: patpatJSON)
         )
     }
 
@@ -190,6 +198,13 @@ final class ChatStore {
                     VALUES (new.rowid, new.text, COALESCE(new.attachmentFilename, ''));
                 END;
             """)
+        }
+        // 微信主题 v2.7: 表情包 sticker_id + 反向拍一拍 patpat 持久化.
+        migrator.registerMigration("v2_add_sticker_patpat") { db in
+            try db.alter(table: "stored_chat_message") { t in
+                t.add(column: "stickerId", .text)
+                t.add(column: "patpatJSON", .text)
+            }
         }
         try migrator.migrate(q)
     }
