@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -32,7 +33,7 @@ class Favorites:
         self.vault_path = (
             Path(vault_path).expanduser()
             if vault_path is not None
-            else Path("~/Documents/星原/眠的小家/收藏夹/").expanduser()
+            else Path(os.environ.get("CCC_FAVORITES_PATH", "~/Documents/收藏夹/")).expanduser()
         ).resolve()
         self._lock = threading.Lock()
         self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)

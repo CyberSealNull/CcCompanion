@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """书房 indexer — 起 launchd 跑. 全扫 vault → fswatch 增量 → calendar 周期拉.
 
-Spec: /Users/mian/Documents/星原/项目/书房/2026-05-09-书房-implementation-plan.md task 4.
+Spec: vault `项目/书房/` implementation plan task 4.
 """
 from __future__ import annotations
 

@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
-VAULT = Path(os.path.expanduser("~/Documents/星原"))
+VAULT = Path(os.environ.get("CCC_VAULT_ROOT", os.path.expanduser("~/Documents")))
 
 TODO_SOURCES = [
     {

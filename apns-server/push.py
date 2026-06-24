@@ -387,7 +387,7 @@ class ServerState:
                 self.active_session = _as.get("active_sid", self.default_session)
             except Exception:
                 pass
-        self.diary = Diary(Path("~/Documents/星原/眠的小家/日记/").expanduser())
+        self.diary = Diary(Path(os.environ.get("CCC_DIARY_PATH", "~/Documents/日记/")).expanduser())
         # 2026-05-11 OTS Diary tab — chain↔用户 chat-style journaling stream.
         # Distinct from `self.diary` (vault markdown CRUD) and `self.chat`
         # (open-ended Cc chat). Per-day JSONL under apns-server/diary_chat/.
@@ -395,7 +395,7 @@ class ServerState:
         self.diary_stream = DiaryStream(diary_stream_dir)
         self.favorites = Favorites(
             jsonl_path=Path(self.token_store_path).expanduser().parent / "favorites.jsonl",
-            vault_path=Path("~/Documents/星原/眠的小家/收藏夹/").expanduser(),
+            vault_path=Path(os.environ.get("CCC_FAVORITES_PATH", "~/Documents/收藏夹/")).expanduser(),
         )
         self.usage = UsageReader()
         self.worklog = Worklog()
@@ -3106,7 +3106,7 @@ class PushHandler(BaseHTTPRequestHandler):
         """vault md 文件数 + 累计字数."""
         import subprocess
         try:
-            base = "/Users/mian/Documents/星原"
+            base = os.environ.get("CCC_VAULT_ROOT", os.path.expanduser("~/Documents"))
             count_r = subprocess.run(
                 ["bash", "-c", f"find '{base}' -name '*.md' -type f 2>/dev/null | wc -l"],
                 capture_output=True, text=True, timeout=10,

@@ -1,6 +1,6 @@
 """书房 v1 — vault-aware project dashboard backend.
 
-Spec: /Users/mian/Documents/星原/项目/书房/2026-05-09-书房-implementation-plan.md
+Spec: vault `项目/书房/` implementation plan.
 Phase 1 — read-only: 今日看板 + 三列项目卡片.
 
 Modules:
@@ -33,7 +33,7 @@ logger = logging.getLogger("cc-apns-server.studyroom")
 
 SCHEMA_VERSION = 1
 
-VAULT_ROOT = Path("/Users/mian/Documents/星原")
+VAULT_ROOT = Path(os.environ.get("CCC_VAULT_ROOT", os.path.expanduser("~/Documents")))
 WATCH_DIRS = [
     VAULT_ROOT / "工作",
     VAULT_ROOT / "投研",
