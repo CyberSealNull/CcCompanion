@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-DEFAULT_VAULT = Path(os.path.expanduser("~/Documents/星原/工作日志/"))
+DEFAULT_VAULT = Path(os.environ.get("CCC_WORKLOG_PATH", os.path.expanduser("~/Documents/工作日志/")))
 
 
 class Worklog:
