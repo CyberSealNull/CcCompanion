@@ -57,3 +57,16 @@ allowed_ips = []
 # default_session sets the tmux session name CcCompanion connects to.
 # Change this to match your own tmux session name.
 # default_session = "cc"
+
+[vault]
+# Obsidian vault 根目录 (绝对路径或 ~/ 展开)
+# 各功能模块 (diary/favorites/worklog/studyroom/todos) 从这里派生子路径
+# 不填则各模块走自己的默认值 (~/Documents 下)
+# 例: root = "~/Documents/MyVault"
+root = ""
+
+# 子路径覆盖 (留空走默认 <root>/日记 等)
+diary = ""
+favorites = ""
+worklog = ""
+studyroom = ""

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import calendar as calendar_mod
+import os
 import random
 import re
 import shutil
@@ -129,7 +130,7 @@ class Diary:
         self.vault_path = (
             vault_path.expanduser()
             if vault_path is not None
-            else Path("~/Documents/星原/眠的小家/日记/").expanduser()
+            else Path(os.environ.get("CCC_DIARY_PATH", "~/Documents/日记/")).expanduser()
         ).resolve()
         self._lock = threading.Lock()
 
