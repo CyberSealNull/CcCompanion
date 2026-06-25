@@ -15,7 +15,7 @@
 CcCompanion is two halves:
 
 1. **`ios-app/`** — a SwiftUI iOS app (TestFlight + soon App Store) that gives you a chat, terminal, and slash-command interface to your Mac's Claude Code from anywhere your iPhone is online.
-2. **`apns-server/`** — a small Python HTTP server you run on your Mac. It forwards your chat messages to a local `tmux` session running `claude`, captures the reply, and pushes it back to your iPhone via Apple Push Notifications (or [Bark](https://github.com/Finb/Bark) as a zero-Apple-Developer-required fallback).
+2. **`apns-server/`** — a small Python HTTP server you run on your Mac or a Linux/VPS host. It forwards your chat messages to a local `tmux` session running `claude`, captures the reply, and pushes it back to your iPhone via Apple Push Notifications (or [Bark](https://github.com/Finb/Bark) as a zero-Apple-Developer-required fallback).
 
 The whole thing is **local-first** — your messages never go through our server. There is no "our server." Your Mac at home talks to your iPhone over Tailscale / ZeroTier / LAN.
 
@@ -143,7 +143,7 @@ You will need to:
 - Set your own bundle identifier in the `CcCompanion` target settings (default is `com.example.cccompanion` and will conflict with anything signed by Apple).
 - Provide your own Apple Developer team for signing (free personal team works for 7-day on-device builds).
 - Enable Push Notifications for that bundle identifier if you want native APNs. The server config bundle id must match exactly, including lowercase `com.starryfield.cccompanion` style casing.
-- Run `apns-server` on a Mac that's reachable from your iPhone, with `config.toml` filled in.
+- Run `apns-server` on a Mac or Linux/VPS host that's reachable from your iPhone, with `config.toml` filled in.
 
 ## Common questions
 
@@ -155,6 +155,15 @@ A: Yes. Skip the `[apns]` section of `config.toml` and use [Bark](https://github
 
 **Q: Is it safe to expose port 8795 to the internet?**
 A: Don't. Run it behind Tailscale / ZeroTier / a reverse proxy with HTTPS + an auth secret. The default `config.toml` ships with `host = "127.0.0.1"` for a reason.
+
+**Q: Can I run the server on Linux / a VPS instead of a Mac?**
+A: Yes. Run `apns-server/push.py` under systemd, keep `claude` in a `tmux` session whose name matches `default_session` in `config.toml`, and expose it over HTTPS — an nginx reverse proxy, or [cloudflared](docs/SETUP_CLOUDFLARED.md) / Tailscale. Keep `strict_auth = true` with a shared secret. See [`docs/SETUP_SERVER.md`](docs/SETUP_SERVER.md) for the Linux/VPS walkthrough.
+
+**Q: The connection dot is red but `curl /health` returns 200 — is the server down?**
+A: No. That dot reflects recent chat-poll freshness and Claude activity, not raw `/health` reachability. On cellular, or behind an idle nginx timeout, a single poll can briefly miss. The current build keeps the dot green whenever the active endpoint's `/health` is reachable, shows "thinking" while Claude is replying, and **never blocks sending** either way.
+
+**Q: Duplicate short replies (e.g. two "Got it.") get dropped — how do I fix it?**
+A: Update `apns-server/claude_hooks/ccc_stop_hook.sh`. The current hook sends a unique `client_msg_id` per turn, so the server dedupes on that id instead of on message content — identical short replies are no longer collapsed. (The content-fallback dedupe window was also narrowed to a few seconds.)
 
 **Q: Why is the Xcode project under `ios-app/CcCompanion/`?**
 A: It is the public Xcode project for CcCompanion. The scheme, project folder, and bundle id are now aligned around the public name.

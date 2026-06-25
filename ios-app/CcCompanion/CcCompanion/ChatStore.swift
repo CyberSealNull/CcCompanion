@@ -22,6 +22,7 @@ struct StoredChatMessage: Codable, FetchableRecord, MutablePersistableRecord {
     var source: String?
     var quotedTs: String?
     var quotedText: String?
+    var quotedRole: String?
     var attachmentUrl: String?
     var attachmentType: String?
     var attachmentFilename: String?
@@ -42,6 +43,7 @@ struct StoredChatMessage: Codable, FetchableRecord, MutablePersistableRecord {
         self.source = message.source
         self.quotedTs = message.quotedTs
         self.quotedText = message.quotedText
+        self.quotedRole = message.quotedRole
         self.attachmentUrl = message.attachmentUrl
         self.attachmentType = message.attachmentType
         self.attachmentFilename = message.attachmentFilename
@@ -63,6 +65,7 @@ struct StoredChatMessage: Codable, FetchableRecord, MutablePersistableRecord {
         self.source = row["source"]
         self.quotedTs = row["quotedTs"]
         self.quotedText = row["quotedText"]
+        self.quotedRole = row["quotedRole"]
         self.attachmentUrl = row["attachmentUrl"]
         self.attachmentType = row["attachmentType"]
         self.attachmentFilename = row["attachmentFilename"]
@@ -84,6 +87,7 @@ struct StoredChatMessage: Codable, FetchableRecord, MutablePersistableRecord {
             source: source,
             quotedTs: quotedTs,
             quotedText: quotedText,
+            quotedRole: quotedRole,
             attachmentUrl: attachmentUrl,
             attachmentType: attachmentType,
             attachmentFilename: attachmentFilename,
@@ -204,6 +208,11 @@ final class ChatStore {
             try db.alter(table: "stored_chat_message") { t in
                 t.add(column: "stickerId", .text)
                 t.add(column: "patpatJSON", .text)
+            }
+        }
+        migrator.registerMigration("v3_add_quoted_role") { db in
+            try db.alter(table: "stored_chat_message") { t in
+                t.add(column: "quotedRole", .text)
             }
         }
         try migrator.migrate(q)
@@ -468,6 +477,7 @@ private extension StoredChatMessage {
         self.source = legacy.source
         self.quotedTs = legacy.quotedTs
         self.quotedText = legacy.quotedText
+        self.quotedRole = nil
         self.attachmentUrl = legacy.attachmentUrl
         self.attachmentType = legacy.attachmentType
         self.attachmentFilename = legacy.attachmentFilename
@@ -477,5 +487,7 @@ private extension StoredChatMessage {
         self.audioJa = legacy.audioJa
         self.locationJSON = legacy.locationJSON
         self.metadataJSON = legacy.metadataJSON
+        self.stickerId = nil
+        self.patpatJSON = nil
     }
 }

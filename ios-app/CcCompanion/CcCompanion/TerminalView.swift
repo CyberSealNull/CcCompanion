@@ -335,16 +335,51 @@ final class TerminalViewModel: ObservableObject {
 struct TerminalView: View {
     @StateObject private var vm = TerminalViewModel()
     @FocusState private var inputFocused: Bool
+    // v2.8 R3b: 观察 ThemeStore 让运行时切微信主题立即重渲终端页皮 (cc 共享单例 state 必须 observe, 否则切主题 body 不重算).
+    @ObservedObject private var themeStore = ThemeStore.shared
+    // v2.8 R3b: ContentView (case 1) 注入 { selectedTab = 0 }; 微信风返回栏点返回箭头回聊天 tab. 其它主题不渲染这栏, onBack 不调.
+    var onBack: () -> Void = {}
+
+    // v2.8 R3b: 微信主题下终端页套绿白皮 — 只 .wechat gate, 其它主题恒走 cc token 零回归.
+    private var isWechat: Bool { themeStore.theme == .wechat }
+    private var skinBg: Color { isWechat ? WechatTermSkin.bg : Color.ccBg }
+    private var skinCard: Color { isWechat ? WechatTermSkin.card : Color.ccCard }
+    private var skinText: Color { isWechat ? WechatTermSkin.ink : Color.ccText }
+    private var skinDim: Color { isWechat ? WechatTermSkin.ink.opacity(0.45) : Color.ccTextDim }
+    private var skinAccent: Color { isWechat ? WechatTermSkin.green : Color.ccAccent }
 
     var body: some View {
         VStack(spacing: 0) {
+            // v2.8 R3b: 微信主题不渲染 tab bar (ContentView .wechat → EmptyView), 进了终端 tab 没返回栏回不去聊天.
+            // 这条微信风返回栏只 .wechat gate, 左上返回箭头 → onBack() (ContentView 注入 selectedTab=0). 视觉对齐 WeChatHeaderBar (ink 箭头/居中标题/浅底).
+            if isWechat {
+                ZStack {
+                    HStack {
+                        Button(action: onBack) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 18, weight: .medium))
+                                .foregroundStyle(WechatTermSkin.ink)
+                        }
+                        .accessibilityLabel("返回")
+                        Spacer()
+                    }
+                    Text("终端")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(WechatTermSkin.ink)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(WechatTermSkin.card)
+            }
             // 顶部 session picker — terminal 风顶部栏
             HStack(spacing: 6) {
-                // 仿 macOS 红黄绿三圆点装饰
-                Circle().fill(Color(red: 1.0, green: 0.36, blue: 0.32)).frame(width: 10, height: 10)
-                Circle().fill(Color(red: 1.0, green: 0.74, blue: 0.18)).frame(width: 10, height: 10)
-                Circle().fill(Color(red: 0.27, green: 0.85, blue: 0.39)).frame(width: 10, height: 10)
-                Spacer().frame(width: 4)
+                // 仿 macOS 红黄绿三圆点装饰 — v2.8 R3b: 微信皮下藏掉 (微信功能页不是黑底终端).
+                if !isWechat {
+                    Circle().fill(Color(red: 1.0, green: 0.36, blue: 0.32)).frame(width: 10, height: 10)
+                    Circle().fill(Color(red: 1.0, green: 0.74, blue: 0.18)).frame(width: 10, height: 10)
+                    Circle().fill(Color(red: 0.27, green: 0.85, blue: 0.39)).frame(width: 10, height: 10)
+                    Spacer().frame(width: 4)
+                }
                 // session 标签横向滚动 防 session 多时 SwiftUI 把 Text 压成竖排
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
@@ -355,12 +390,12 @@ struct TerminalView: View {
                             } label: {
                                 Text(s)
                                     .font(.system(size: 11, design: .monospaced).weight(s == vm.session ? .semibold : .regular))
-                                    .foregroundStyle(s == vm.session ? Color.white : Color.ccTextDim)
+                                    .foregroundStyle(s == vm.session ? Color.white : skinDim)
                                     .lineLimit(1)
                                     .fixedSize(horizontal: true, vertical: false)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 3)
-                                    .background(s == vm.session ? Color.ccAccent : Color.clear)
+                                    .background(s == vm.session ? skinAccent : Color.clear)
                                     .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                             }
                         }
@@ -368,18 +403,18 @@ struct TerminalView: View {
                 }
                 Text(vm.content.isEmpty ? "" : "\(vm.content.split(separator: "\n").count) lines")
                     .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(Color.ccTextDim)
+                    .foregroundStyle(skinDim)
                 Button {
                     Task { await vm.fetchSessions(); await vm.fetchCapture() }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.ccSerifAdaptive(size: 12))
-                        .foregroundStyle(Color.ccTextDim)
+                        .foregroundStyle(skinDim)
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .background(Color.ccCard)
+            .background(skinCard)
 
             // 终端输出 — pure black bg + green text 经典 terminal 风
             ScrollViewReader { proxy in
@@ -387,7 +422,7 @@ struct TerminalView: View {
                     HStack(alignment: .top, spacing: 0) {
                         Text(vm.content.isEmpty ? "// 等待 tmux 输出..." : vm.content)
                             .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(Color.ccText)
+                            .foregroundStyle(skinText)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 12)
@@ -396,7 +431,7 @@ struct TerminalView: View {
                         Spacer(minLength: 0)
                     }
                 }
-                .background(Color.ccBg)
+                .background(skinBg)
                 .onChange(of: vm.content) { _, _ in
                     withAnimation(.linear(duration: 0.1)) {
                         proxy.scrollTo("end", anchor: .bottom)
@@ -421,30 +456,30 @@ struct TerminalView: View {
             // 只在 Terminal tab 显示 chat tab 不显 (此处 view 本身就是 Terminal tab)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    TerminalShortcutButton(label: "Esc") { Task { await vm.sendSpecialKey(.escape) } }
-                    TerminalShortcutButton(label: "↑") { Task { await vm.sendSpecialKey(.up) } }
-                    TerminalShortcutButton(label: "↑↑") { Task { await vm.sendRepeatedSpecialKey(.up, count: 2) } }
-                    TerminalShortcutButton(label: "↓") { Task { await vm.sendSpecialKey(.down) } }
-                    TerminalShortcutButton(label: "Enter") { Task { await vm.sendSpecialKey(.enter) } }
-                    TerminalShortcutButton(label: "clear") { Task { await vm.sendSlashClear() } }
+                    TerminalShortcutButton(label: "Esc", isWechat: isWechat) { Task { await vm.sendSpecialKey(.escape) } }
+                    TerminalShortcutButton(label: "↑", isWechat: isWechat) { Task { await vm.sendSpecialKey(.up) } }
+                    TerminalShortcutButton(label: "↑↑", isWechat: isWechat) { Task { await vm.sendRepeatedSpecialKey(.up, count: 2) } }
+                    TerminalShortcutButton(label: "↓", isWechat: isWechat) { Task { await vm.sendSpecialKey(.down) } }
+                    TerminalShortcutButton(label: "Enter", isWechat: isWechat) { Task { await vm.sendSpecialKey(.enter) } }
+                    TerminalShortcutButton(label: "clear", isWechat: isWechat) { Task { await vm.sendSlashClear() } }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
             }
             .frame(height: 40)
-            .background(Color.ccCard)
-            .overlay(Rectangle().fill(Color.ccTextDim.opacity(0.12)).frame(height: 1), alignment: .top)
+            .background(skinCard)
+            .overlay(Rectangle().fill((isWechat ? WechatTermSkin.ink : Color.ccTextDim).opacity(0.12)).frame(height: 1), alignment: .top)
 
             // 输入区 — prompt 风
             HStack(spacing: 8) {
                 Text("$")
                     .font(.system(size: 14, design: .monospaced).weight(.bold))
-                    .foregroundStyle(Color.ccAccent)
+                    .foregroundStyle(skinAccent)
 
-                TextField("", text: $vm.draft, prompt: Text("命令").foregroundStyle(Color.ccTextDim), axis: .vertical)
+                TextField("", text: $vm.draft, prompt: Text("命令").foregroundStyle(skinDim), axis: .vertical)
                     .lineLimit(1...4)
                     .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(Color.ccText)
+                    .foregroundStyle(skinText)
                     .focused($inputFocused)
                     .submitLabel(.send)
                     .onSubmit { Task { await vm.send() } }
@@ -460,15 +495,15 @@ struct TerminalView: View {
                 } label: {
                     Image(systemName: vm.sending ? "ellipsis.circle" : "return")
                         .font(.ccSerifAdaptive(size: 20, weight: .semibold))
-                        .foregroundStyle(vm.draft.isEmpty && !vm.sending ? Color.white.opacity(0.25) : Color.ccAccent)
+                        .foregroundStyle(vm.draft.isEmpty && !vm.sending ? (isWechat ? WechatTermSkin.ink.opacity(0.25) : Color.white.opacity(0.25)) : skinAccent)
                 }
                 .disabled(vm.sending)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .background(Color.ccCard)
+            .background(skinCard)
         }
-        .background(Color.ccBg)
+        .background(skinBg)
         // Phase E 2026-05-11 — 删 nav 顶部 "终端 cc" 标题, tab 顶部不显 session name
         #if os(iOS)
         .navigationBarHidden(true)
@@ -478,23 +513,33 @@ struct TerminalView: View {
     }
 }
 
+// v2.8 R3b: 微信主题终端页配色常量 (绿白皮). 仅 .wechat gate 引用, 其它主题不碰. #07C160 微信绿同 FloatingTabBar/ChatView wechatAccent, ink 同 WeChatHeaderBar inkColor.
+private enum WechatTermSkin {
+    static let green = Color(red: 0.027, green: 0.756, blue: 0.376)  // #07C160 微信绿
+    static let ink = Color(red: 0.094, green: 0.094, blue: 0.094)    // 微信深墨字
+    static let bg = Color(red: 0.929, green: 0.929, blue: 0.929)     // #EDEDED 微信浅灰底
+    static let card = Color.white                                    // 卡片/栏白底
+}
+
 // 2026-05-19 终端快捷按钮 — 输入框上方横排 monospace 胶囊
 private struct TerminalShortcutButton: View {
     let label: String
+    // v2.8 R3b: 微信皮下快捷键胶囊走绿白 (ink 字 / 浅底 / ink 描边), 其它主题恒走 cc token 零回归.
+    var isWechat: Bool = false
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Text(label)
                 .font(.system(size: 13, design: .monospaced).weight(.medium))
-                .foregroundStyle(Color.ccText)
+                .foregroundStyle(isWechat ? WechatTermSkin.ink : Color.ccText)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
-                .background(Color.ccBg)
+                .background(isWechat ? WechatTermSkin.bg : Color.ccBg)
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Color.ccTextDim.opacity(0.25), lineWidth: 0.5)
+                        .stroke((isWechat ? WechatTermSkin.ink : Color.ccTextDim).opacity(0.25), lineWidth: 0.5)
                 )
         }
         .buttonStyle(.plain)

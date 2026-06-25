@@ -30,6 +30,12 @@ final class EndpointResolver: ObservableObject {
     @Published private(set) var resolving: Bool = false
     @Published var activeIndex: Int = CcServerConfig.activeIndex
 
+    /// Fix (VPS feedback 2026-06-24 #3 health split): 当前 active endpoint 最近一次 /health 是否 200.
+    /// Chat 页用它把「server 可达」跟「最近 chat poll / Claude 活动」拆开, 让 stale poll 不再误红点离线.
+    var activeReachable: Bool {
+        activeIndex >= 0 && activeIndex < statuses.count && statuses[activeIndex] == .ok
+    }
+
     private var failureCount: Int = 0
     private var pollTask: Task<Void, Never>? = nil
     private let healthTimeoutSec: TimeInterval = 8.0  // Tailscale DERP cold-start 可能 > 2s

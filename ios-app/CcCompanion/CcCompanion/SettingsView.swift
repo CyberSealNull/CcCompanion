@@ -717,18 +717,16 @@ struct CcSettingsView: View {
 
                     // v2.6 拍一拍后缀: 微信主题双击对方头像后「我拍了拍 "名称"」拼这个后缀.
                     // 不 gate 微信主题显示 — 微信主题隐藏了 tab 到不了设置页, 后缀必须在其它主题可设 (设了存 AppStorage, 切微信主题生效).
-                    HStack {
-                        Text("拍一拍后缀")
-                            .font(.ccSerifAdaptive(size: 15))
-                            .foregroundStyle(Color.ccText)
-                        Spacer()
+                    // v2.8 R1: 回一行平铺 (推翻 v2.7 上下两行 VStack). 阿眠真机要跟同页其它设置行 (toggleRow / aiName 行)
+                    // 一致的左标签 + 右输入. 用 rowToggleableText wrapper 跟它们统一; TextField 去掉 .frame(maxWidth:160) 死限
+                    // (那才是长文本溢出右缘根源), 照 aiName 行 .plain + .trailing 让它吃 Spacer 后剩余宽右对齐滚动, 长后缀不溢出.
+                    rowToggleableText(label: "拍一拍后缀") {
                         TextField("如 的脑袋", text: $patpatSuffix)
-                            .multilineTextAlignment(.trailing)
+                            .textFieldStyle(.plain)
                             .font(.ccSerifAdaptive(size: 15))
                             .foregroundStyle(Color.ccTextDim)
-                            .frame(maxWidth: 160)
+                            .multilineTextAlignment(.trailing)
                     }
-                    .padding(.vertical, 4)
                 }
 
                 // 终端 session 顺序 (build226) — 拖动自定义终端 tab 的 session 排序

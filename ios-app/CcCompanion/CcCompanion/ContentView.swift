@@ -95,11 +95,13 @@ struct ContentView: View {
         VStack(spacing: 0) {
             Group {
                 switch selectedTab {
-                case 0: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken) }
-                case 1: NavigationStack { TerminalView() }
+                case 0: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken, onEnterTerminal: { selectedTab = 1 }) }
+                // v2.8 R3b 真机修: 从终端返回聊天页时 bump chatScrollToken, 触发 ChatView .onChange(of:scrollToken)→scrollBottom,
+                // 否则视图复用不走 onAppear、token 不变不触发 onChange, 返回后卡在旧滚动位置要手动下拉。
+                case 1: NavigationStack { TerminalView(onBack: { selectedTab = 0; chatScrollToken &+= 1 }) }
                 case 2: NavigationStack { CcSettingsView() }
                 case 3 where featureGroupView: NavigationStack { GroupChatView(store: groupStore) }
-                default: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken) }
+                default: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken, onEnterTerminal: { selectedTab = 1 }) }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -122,6 +124,8 @@ struct ContentView: View {
         .onChange(of: theme.theme) { _, newTheme in
             if newTheme == .wechat {
                 selectedTab = 0
+                // v2.8: 原首次切微信主题弹屏中 toast 提示长按昵称进终端, 改成 WeChatHeaderBar 昵称正下方的引导气泡
+                // (更直观且覆盖冷启动就在微信主题不触发 onChange 的情况). toast 移除, 见 WeChatHeaderBar.terminalHintBubble.
             }
         }
         // Phase E 2026-05-11 — cccompanion build 也要能弹 FavoritesView

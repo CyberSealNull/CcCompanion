@@ -1,37 +1,29 @@
 import SwiftUI
 import Combine
 
-// 微信主题 v2.7 C: 微信昵称.
-// 只微信主题读 GET /status/wechat_nick (顶栏 + 反向拍一拍灰字用), 其它主题仍走原 aiName.
-// 拉取前 / 失败回退 FlavorConfig.defaultWechatNick (私版默认 AI 名 / 公开版中性).
-
-private struct WechatNickResponse: Codable {
-    let ok: Bool?
-    let nick: String?
-}
+// 微信主题 v2.8 修: 微信顶栏昵称改成跟设置里的「AI 名字」(ai_name) 走, 不再读 server /status/wechat_nick.
+// 根因: 旧 v2.7 C 版只拉 server wechat_nick, 跟本地 ai_name 完全脱节, 用户在设置改了 AI 名字微信顶栏不变。
+// 设置/Onboarding 改名 → CcNameResolver.notifyChanged() 发 .ccIdentityDidChange → 这里实时刷新, 顶栏 + 反向拍一拍灰字 + 引用块全跟着变。
 
 @MainActor
 final class WechatNickStore: ObservableObject {
     static let shared = WechatNickStore()
 
-    @Published private(set) var nick: String = FlavorConfig.defaultWechatNick
+    @Published private(set) var nick: String = CcNameResolver.name(for: .ai)
 
-    private var lastLoaded: Date?
+    private var cancellable: AnyCancellable?
 
-    /// 进微信主题 / app 启动调. 60s 内有缓存且非强制不重复拉.
-    func refresh(force: Bool = false) {
-        if !force, let last = lastLoaded, Date().timeIntervalSince(last) < 60 { return }
-        Task { await load() }
+    private init() {
+        // 订阅改名通知, ai_name 一变微信昵称立刻跟着变 (跟其它主题统一).
+        cancellable = NotificationCenter.default.publisher(for: .ccIdentityDidChange)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.refresh() }
+            }
     }
 
-    func load() async {
-        let url = CcServerConfig.serverURL.appendingPathComponent("status/wechat_nick")
-        if let (data, _) = try? await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url)),
-           let resp = try? JSONDecoder().decode(WechatNickResponse.self, from: data),
-           let n = resp.nick, !n.isEmpty {
-            self.nick = n
-            self.lastLoaded = Date()
-        }
-        // 失败保留旧值, 不崩.
+    /// 进微信主题 / app 启动 / 改名后调, 同步当前 ai_name (兼容旧调用点 onAppear { refresh() }).
+    func refresh(force: Bool = false) {
+        nick = CcNameResolver.name(for: .ai)
     }
 }

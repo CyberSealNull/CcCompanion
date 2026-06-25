@@ -61,6 +61,7 @@ from favorites import Favorites
 from worklog import Worklog
 from reminders import ReminderStore
 from timeline import Timeline
+import wechat_summary
 from tts import TTS
 from settings import Settings
 from usage import UsageReader
@@ -374,6 +375,11 @@ class ServerState:
         attachments_dir = Path(self.token_store_path).expanduser().parent / "attachments"
         attachments_dir.mkdir(parents=True, exist_ok=True)
         self.attachments_dir = attachments_dir
+        from wechat_v27 import PatPatGate, StickerStore, WechatNickStore
+        v27_dir = Path(self.token_store_path).expanduser().parent
+        self.stickers = StickerStore(v27_dir / "stickers.json")
+        self.wechat_nick = WechatNickStore(v27_dir / "wechat_nick.json", default="Cc")
+        self.patpat_gate = PatPatGate(v27_dir / "patpat_state.json", daily_cap=3)
         # 用户偏好 settings (TTS toggle 等)
         settings_path = Path(self.token_store_path).expanduser().parent / "settings.json"
         self.settings = Settings(settings_path)
@@ -695,6 +701,43 @@ class PushHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             return
+        if self.path.startswith("/wechat-timeline/groups"):
+            try:
+                cfg = wechat_summary.load_config()
+                self._send_json(200, {"ok": True, "groups": cfg.get("groups", [])})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if self.path.startswith("/wechat-timeline/dates"):
+            try:
+                qs = self._query()
+                group = self._query_value(qs, "group")
+                dates = wechat_summary.get_available_dates(group=group)
+                self._send_json(200, {"ok": True, "dates": dates})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if self.path.startswith("/wechat-timeline"):
+            try:
+                qs = self._query()
+                date = self._query_value(qs, "date")
+                group = self._query_value(qs, "group")
+                if not date:
+                    date = datetime.now().strftime("%Y-%m-%d")
+                summaries = wechat_summary.load_summaries(date=date, group=group)
+                self._send_json(200, {"ok": True, "date": date, "summaries": summaries})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+        if self.path == "/stickers/list":
+            self._send_json(200, {"ok": True, "stickers": self.state.stickers.list()})
+            return
+        if self.path == "/status/wechat_nick":
+            self._send_json(200, {"ok": True, **self.state.wechat_nick.get()})
+            return
+        if self.path == "/status/patpat":
+            self._send_json(200, {"ok": True, **self.state.patpat_gate.snapshot()})
+            return
         if self.path == "/drivers/state":
             try:
                 state_path = os.path.expanduser("~/CcCompanion/opia_drivers_state.json")
@@ -916,6 +959,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/chat/upload"):
             self._handle_chat_upload()
             return
+        if self.path.startswith("/stickers/upload"):
+            self._handle_sticker_upload()
+            return
         # Build 217-patch-A: /group/upload mirrors /chat/upload but writes to
         # group_chat with sender_id (default "amian") instead of chat.role.
         if self.path.startswith("/group/upload"):
@@ -992,6 +1038,12 @@ class PushHandler(BaseHTTPRequestHandler):
             self._handle_pet_activity_post(body)
         elif self.path == "/chat/append":
             self._handle_chat_append(body)
+        elif self.path == "/status/wechat_nick":
+            self._handle_wechat_nick_post(body)
+            return
+        elif self.path == "/status/patpat":
+            self._handle_patpat_post(body)
+            return
         elif self.path == "/chain/abort":
             # P0-2: remote control gate
             if not self.state.allow_remote_control:
@@ -2524,7 +2576,7 @@ class PushHandler(BaseHTTPRequestHandler):
         delivery.setdefault("dispatch_id", dispatch_id)
         if not targets:
             return dispatch_id
-        context = "\n".join(self.state.group_chat.context_lines(limit=20))
+        context = "\n".join(self.state.group_chat.context_lines(limit=5))
         for agent_id in targets:
             self.state.group_chat.set_typing(agent_id, True, dispatch_id=dispatch_id)
         try:
@@ -3211,7 +3263,12 @@ class PushHandler(BaseHTTPRequestHandler):
         text = body.get("text", "").strip()
         quoted_ts = body.get("quoted_ts") or None
         location = body.get("location") or None
-        if not text and not location:
+        sticker_id = (body.get("sticker_id") or "").strip() or None
+        sticker_desc = None
+        if sticker_id:
+            sticker = self.state.stickers.get(sticker_id)
+            sticker_desc = (sticker.get("desc") if sticker else "") or ""
+        if not text and not location and not sticker_id:
             self._send_json(400, {"error": "text or location required"})
             return
         # 写 user 历史
@@ -3221,6 +3278,7 @@ class PushHandler(BaseHTTPRequestHandler):
             source="ios-app",
             quoted_ts=quoted_ts,
             location=location,
+            sticker_id=sticker_id,
         )
         # 包 quote 进注入文本 (主 session 收到 channel tag 内含 quote 上下文 + 时间戳跟 wechat 一致)
         from datetime import datetime as _dt
@@ -3230,6 +3288,9 @@ class PushHandler(BaseHTTPRequestHandler):
         if self.state.settings.get("tts_enabled"):
             tts_hint = "[语音模式 这一条带标点回复]\n"
         injected = f"{ts_prefix} {tts_hint}{text}"
+        if sticker_id:
+            sticker_hint = f"[User sent a sticker [Sticker:{sticker_id}] meaning: {sticker_desc or sticker_id}]"
+            injected = f"{ts_prefix} {tts_hint}{sticker_hint}" + (f"\n{text}" if text else "")
         if rec.get("location"):
             loc = rec["location"]
             label = loc.get("label", "")
@@ -3243,24 +3304,172 @@ class PushHandler(BaseHTTPRequestHandler):
                 injected = f"{ts_prefix} {tts_hint}[引用 \"{rec['quoted_text']}\"]\n{loc_str}"
                 if text:
                     injected = f"{injected}\n{text}"
-        # set typing — Cc 收到 message 在 thinking
+        # set typing — assistant 收到 message 在 thinking
         self.state.typing_state = {"is_typing": True, "since": rec["ts"]}
-        # 注入文本到 active tmux session
-        # 2026-05-14 build 200 — 不依赖 ~/scripts/bus_send.py (Opia 内部 file, ccc 公开版用户没有)
-        # 如果 bus_send.py 存在 用它走 bus dispatcher 路由 (Opia 内部多 agent 协调用)
-        # 不存在 fallback 直接 tmux paste-buffer + send-keys 注入 (ccc 公开版默认走这条)
+        # 注入文本到 active tmux session.
+        # 不依赖 ~/scripts/bus_send.py (内部多 agent 协调 file, 公开版用户没有); 存在就走 bus
+        # dispatcher 路由, 不存在 fallback 直接 tmux paste-buffer + send-keys (公开版默认).
         target_session = (self.state.active_session or self.state.default_session).strip()
-        ok, err = self._inject_to_session(target_session, injected, source="ios-app", sender="iphone")
+        # Fix (VPS 用户反馈 2026-06-24 #1 async enqueue): 之前同步等 _inject_to_session 的 tmux
+        # paste/send-keys 完成才返回, 注入期间再发一条会被客户端当成请求未送达 (nginx 看不到第二个
+        # 请求, iOS 报 network connection lost). 改成: 先 fast preflight 确认 target session 可达
+        # (不存在立刻 502, 不假成功), 再把 (可能慢的) 注入丢到后台 daemon thread, 立刻返回. 后台注入
+        # 失败追加一条 system error record + 清 typing, 让用户不会以为消息已被 chain 收到.
+        ok, err = self._chat_send_preflight(target_session)
         if not ok:
-            # 注入失败 (target session 不存在 / tmux 没装 / bus_send crash 等). 用 502 surface
-            # 给客户端 不再 silent 200 — 否则 ccc app 显示发送成功但 chain 根本收不到.
+            self.state.typing_state = {"is_typing": False, "since": rec["ts"]}
             self._send_json(502, {
                 "ok": False,
-                "error": f"inject to tmux session '{target_session}' failed: {err}",
+                "error": f"target session '{target_session}' not reachable: {err}",
                 "record": rec,
             })
             return
-        self._send_json(200, {"ok": True, "record": rec})
+
+        def _bg_inject(sess: str, payload: str, since_ts: str):
+            inj_ok, inj_err = self._inject_to_session(sess, payload, source="ios-app", sender="iphone")
+            if not inj_ok:
+                try:
+                    self.state.chat.append(
+                        role="system",
+                        text=f"[消息注入失败 inject failed: {inj_err}]",
+                        source="server-inject-error",
+                    )
+                except Exception as e2:
+                    logger.warning("inject failed + error-record append failed: %s / %s", inj_err, e2)
+                self.state.typing_state = {"is_typing": False, "since": since_ts}
+
+        threading.Thread(
+            target=_bg_inject,
+            args=(target_session, injected, rec["ts"]),
+            daemon=True,
+        ).start()
+        # 200 + queued: user record 已落 (poll 立即可见), 注入已排队后台执行. 客户端把它当发送成功.
+        self._send_json(200, {"ok": True, "record": rec, "queued": True})
+
+    def _handle_sticker_upload(self):
+        """Upload a custom sticker as a raw image body plus query metadata."""
+        import uuid as _uuid
+        from urllib.parse import parse_qs, unquote, urlparse
+
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        qs = parse_qs(urlparse(self.path).query)
+
+        def _q(key: str, default: str | None = None) -> str | None:
+            value = qs.get(key, [None])[0] or self.headers.get("X-" + key.capitalize())
+            if value is None:
+                return default
+            try:
+                return unquote(value)
+            except Exception:
+                return value
+
+        sid = (_q("id") or _uuid.uuid4().hex[:10]).strip()
+        sid = "".join(c for c in sid if c.isalnum() or c == "_") or _uuid.uuid4().hex[:10]
+        desc = (_q("desc") or "").strip()
+        orig_name = (_q("filename") or "sticker.png").strip()
+        ext = Path(orig_name).suffix.lower()
+        if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"}:
+            ext = ".png"
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except Exception:
+            length = 0
+        if length <= 0 or length > 10 * 1024 * 1024:
+            self._send_json(400, {"error": "invalid content-length (max 10MB)"})
+            return
+
+        stored_name = f"sticker_{sid}{ext}"
+        stored_path = self.state.attachments_dir / stored_name
+        try:
+            with stored_path.open("wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+        except Exception as e:
+            logger.exception("sticker upload write fail")
+            self._send_json(500, {"error": f"write fail: {e}"})
+            return
+
+        url = f"/attachments/{stored_name}"
+        try:
+            entry = self.state.stickers.upsert(sticker_id=sid, filename=stored_name, desc=desc, url=url)
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        self._send_json(200, {"ok": True, "sticker": entry})
+
+    def _handle_wechat_nick_post(self, body: dict[str, Any]):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        nick = (body.get("nick") or "").strip()
+        if not nick:
+            self._send_json(400, {"error": "nick required"})
+            return
+        try:
+            out = self.state.wechat_nick.set(nick)
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        self._send_json(200, {"ok": True, **out})
+
+    def _handle_patpat_post(self, body: dict[str, Any]):
+        if not self._check_auth():
+            self._send_json(401, {"error": "auth required"})
+            return
+        suffix = (body.get("suffix") or "").strip()[:40]
+        allowed, reason = self.state.patpat_gate.consume()
+        if not allowed:
+            self._send_json(200, {"ok": True, "skipped": True, "reason": reason})
+            return
+        nick = self.state.wechat_nick.get().get("nick", "Cc")
+        text = f"{nick}拍了拍我{suffix}"
+        patpat = {"from": "ai", "suffix": suffix, "nick": nick}
+        rec = self.state.chat.append(role="assistant", text=text, source="ios-app", patpat=patpat)
+        try:
+            self._send_chat_notification(nick, text)
+        except Exception as e:
+            logger.warning("patpat push fail: %s", e)
+        self._send_json(200, {"ok": True, "record": rec, "patpat": patpat})
+
+    def _chat_send_preflight(self, session: str):
+        """Fast best-effort reachability check for /chat/send before we accept + return.
+        Returns (ok, err). Does NOT do the (potentially slow) paste — that runs async in a
+        background thread. Mirrors the bus-vs-tmux choice in _inject_to_session: if the
+        internal bus dispatcher is reachable we can't cheaply verify the routed target, so
+        we accept and let the async inject surface any real failure; otherwise we do a quick
+        `tmux has-session` so a missing session fails fast instead of faking success."""
+        import os
+        import socket
+        bus_path = self.state.bus_send_path
+        bus_sock = "/tmp/opia_bus.sock"
+        if bus_path and os.path.exists(bus_path) and os.path.exists(bus_sock):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.2)
+                    s.connect(bus_sock)
+                return True, ""
+            except Exception:
+                pass  # bus not actually reachable — fall through to the tmux check
+        try:
+            has = subprocess.run(
+                ["tmux", "has-session", "-t", session],
+                capture_output=True, text=True, timeout=2,
+            )
+            if has.returncode != 0:
+                return False, f"tmux session '{session}' not found (run: tmux new-session -d -s {session} 'claude --dangerously-skip-permissions')"
+        except FileNotFoundError:
+            return False, "tmux not installed on the server host"
+        except Exception as e:
+            return False, f"tmux has-session check failed: {e}"
+        return True, ""
 
     def _inject_to_session(self, session: str, text: str, source: str = "ios-app", sender: str = "iphone"):
         """Inject text into target tmux session. Returns (success, error_msg).
@@ -3618,6 +3827,10 @@ class PushHandler(BaseHTTPRequestHandler):
         attachment_type = body.get("attachment_type") or None
         attachment_filename = body.get("attachment_filename") or None
         local_path = body.get("attachment_path") or None
+        sticker_id = (body.get("sticker_id") or "").strip() or None
+        patpat = body.get("patpat") or None
+        if patpat and not isinstance(patpat, dict):
+            patpat = None
         if local_path:
             import uuid as _uuid, shutil
             src = Path(local_path).expanduser()
@@ -3635,7 +3848,7 @@ class PushHandler(BaseHTTPRequestHandler):
             if not attachment_filename:
                 attachment_filename = src.name
 
-        if not text and not attachment_url:
+        if not text and not attachment_url and not sticker_id and not patpat:
             self._send_json(400, {"error": "text or attachment required"})
             return
 
@@ -3653,16 +3866,26 @@ class PushHandler(BaseHTTPRequestHandler):
             now_ts = time.time()
             if client_msg_id:
                 cache_key = f"cmid:{client_msg_id}"
+                # explicit client idempotency key — keep the wide retry window.
+                dedupe_window = 60.0
             else:
-                cache_key = f"{role}|{text[:200]}|{body.get('source', '')}|{attachment_url or ''}|{attachment_filename or ''}"
+                cache_key = f"{role}|{text[:200]}|{body.get('source', '')}|{attachment_url or ''}|{attachment_filename or ''}|{sticker_id or ''}"
+                # Fix (VPS 用户反馈 2026-06-24 #4 dedup): content-fallback 窗口原本 60s, 会把合法的
+                # 连续相同短回复吞掉 (例如连着两条 "Got it." 命中同 key, 第二条不入库, iOS poll 的
+                # since 不再推进). 收窄到 retry-only 窗口, 真重复内容现在能写进去; cmid dedupe (上面
+                # 60s) 仍是主幂等机制 (默认 stop hook 现在每轮都带 client_msg_id).
+                dedupe_window = 4.0
             entry = cache.get(cache_key)
             last_ts = entry[0] if isinstance(entry, tuple) else (entry or 0)
-            if now_ts - last_ts < 60.0:
-                cached_rec = entry[1] if isinstance(entry, tuple) else None
+            cached_rec = entry[1] if isinstance(entry, tuple) else None
+            if now_ts - last_ts < dedupe_window and cached_rec is not None:
+                # genuine duplicate with a real cached record to return.
                 _ms = int((time.time() - _req_t0) * 1000)
                 print(f"chat_append_ms={_ms} dedupe_hit=1 role={role}", file=sys.stderr, flush=True)
                 self._send_json(200, {"ok": True, "duplicate": True, "deduped": True, "record": cached_rec})
                 return
+            # else: 窗口外, 或只命中一个 in-flight 占位 (cached_rec=None) — 不返回 record:null / 不静默
+            # 丢弃, 正常落库 (修掉原本 cached_rec 为空仍当 duplicate 返回的 bug).
             # 占位 真 rec 入库后回填
             cache[cache_key] = (now_ts, None)
             dedupe_cache_key = cache_key
@@ -3722,6 +3945,8 @@ class PushHandler(BaseHTTPRequestHandler):
             attachment_filename=attachment_filename,
             metadata=metadata,
             turn_id=reply_turn_id,
+            sticker_id=sticker_id,
+            patpat=patpat,
         )
 
         # move 成功 append 后缓存 client_msg_id (LRU 100)
@@ -4751,6 +4976,7 @@ def run_server(state: ServerState):
         target=cleanup_loop, args=(state,), daemon=True, name="cleanup"
     )
     cleanup_thread.start()
+    wechat_summary.start_hourly_thread()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

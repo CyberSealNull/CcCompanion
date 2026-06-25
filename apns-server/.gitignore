@@ -5,3 +5,5 @@ config.toml
 secrets/
 tokens/
 *.bak.*
+wechat_summary_config.json
+state/wechat_summaries.jsonl

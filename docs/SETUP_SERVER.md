@@ -206,7 +206,42 @@ sudo systemctl status ots-server
 
 ### 8. 公网通路
 
-跟 macOS 一样，Tailscale 或 Cloudflare Tunnel 推荐。也可路由器层端口转发到 8795 + 用 caddy 加 HTTPS。
+**首选 cloudflared 或 Tailscale**（不用开公网端口、不用自己管证书），步骤跟 macOS 那节一样，见 [SETUP_CLOUDFLARED.md](SETUP_CLOUDFLARED.md) 与 [SETUP_PRIVATE_NETWORK.md](SETUP_PRIVATE_NETWORK.md)。
+
+如果要在 VPS 上直接用 nginx 做 HTTPS 反代，最小配置如下：
+
+```nginx
+# /etc/nginx/sites-available/ots
+server {
+    listen 443 ssl;
+    server_name ots.your-domain.com;
+
+    ssl_certificate     /etc/letsencrypt/live/ots.your-domain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ots.your-domain.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8795;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # chat poll 是低频长轮询，别让 nginx 过早掐断空闲连接
+        proxy_read_timeout  120s;
+        proxy_send_timeout  120s;
+        proxy_buffering     off;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/ots /etc/nginx/sites-enabled/ots
+sudo certbot --nginx -d ots.your-domain.com    # 自动签发并续期 Let's Encrypt 证书
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+iPhone 端 server 地址填 `https://ots.your-domain.com`。push.py 仍只 `host = "127.0.0.1"` 监听本地，公网只经 nginx 进来，并保持 `config.toml` 里 `strict_auth = true` 加 shared_secret。
+
+> 提示：`proxy_read_timeout` 给够（≥120s）。如果 nginx 空闲超时太短，chat 页会偶发「连不上」的假象，这正是 health 红点闪动的常见诱因之一。
 
 ---
 

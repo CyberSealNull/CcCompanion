@@ -225,9 +225,12 @@ extension Color {
         }
     }
     static var ccFloatingBarText: Color {
+        // 此值仅用于 FloatingTabBar 的「非选中」tab 文字 (FloatingTabBar.swift inactiveFg)。
+        // 选中文字另走 ccAccent，不受此影响。warm 主题改用 warmTextDim 暖灰褐，
+        // 避免近黑深褐在奶油色 tab 背景上发黑发丑 (用户 2026-06-25 选方案 A)。
         switch ThemeStore.shared.theme {
         case .terminal, .night: return ccText
-        case .warm: return warmText
+        case .warm: return warmTextDim
         case .wechat: return wechatText
         }
     }
@@ -342,10 +345,11 @@ nonisolated struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     let source: String?
     let quotedTs: String?
     let quotedText: String?
+    var quotedRole: String? = nil
     let attachmentUrl: String?
     let attachmentType: String?  // "image" | "file"
     let attachmentFilename: String?
-    let reactions: [String]?
+    var reactions: [String]?
     let audioZh: String?
     let audioEn: String?
     let audioJa: String?
@@ -369,6 +373,7 @@ nonisolated struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         case ts, role, text, source, reactions
         case quotedTs = "quoted_ts"
         case quotedText = "quoted_text"
+        case quotedRole = "quoted_role"
         case attachmentUrl = "attachment_url"
         case attachmentType = "attachment_type"
         case attachmentFilename = "attachment_filename"
@@ -385,6 +390,12 @@ nonisolated struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
 
     var id: String { localId ?? (ts + role) }
     var isUser: Bool { role == "user" }
+
+    func withReactions(_ newReactions: [String]?) -> ChatMessage {
+        var copy = self
+        copy.reactions = newReactions
+        return copy
+    }
 
     func attachmentFullURL() -> URL? {
         guard let path = attachmentUrl else { return nil }
@@ -725,11 +736,18 @@ final class ChatViewModel: ObservableObject {
     }
     @Published private(set) var visibleLimit: Int = 300 { didSet { rebuildDisplayedRowsCache() } }
 
+    // Chat 页状态点: thinking (Claude 正在回复) / connected (server 可达且最近 poll 新鲜) /
+    // offline (server 真不可达). 注意: 这个状态**不阻塞发送**, 只是活动指示器.
     var connectionStatus: ChatConnectionStatus {
         if ccStatus == "typing" || isCcTyping { return .thinking }
         if let lastNetworkSuccessAt, Date().timeIntervalSince(lastNetworkSuccessAt) <= 30 {
             return .connected
         }
+        // Fix (VPS feedback 2026-06-24 #3 health split): 之前 chat poll 一 stale (cellular / nginx
+        // idle timeout / app 切后台) 就直接红点 offline, 即使 server /health 还是 200. 拆开: 只要
+        // EndpointResolver 最近一次 active endpoint /health OK = server 可达, 显 connected (idle),
+        // 不显断开. 只有 /health 真失败才 offline. 无论哪种都不阻塞发送.
+        if EndpointResolver.shared.activeReachable { return .connected }
         return .offline
     }
 
@@ -1439,16 +1457,7 @@ final class ChatViewModel: ObservableObject {
                     updated.append(emoji)
                 }
                 let m = self.messages[idx]
-                self.messages[idx] = ChatMessage(
-                    ts: m.ts, role: m.role, text: m.text, source: m.source,
-                    quotedTs: m.quotedTs, quotedText: m.quotedText,
-                    attachmentUrl: m.attachmentUrl, attachmentType: m.attachmentType,
-                    attachmentFilename: m.attachmentFilename,
-                    reactions: updated.isEmpty ? nil : updated,
-                    audioZh: m.audioZh, audioEn: m.audioEn, audioJa: m.audioJa,
-                    location: m.location,
-                    metadata: m.metadata
-                )
+                self.messages[idx] = m.withReactions(updated.isEmpty ? nil : updated)
             }
         } catch {
             self.lastError = "reaction 失败: \(error.localizedDescription)"
@@ -2291,7 +2300,7 @@ final class ChatViewModel: ObservableObject {
         //    inserts). On failure: keep the optimistic record, flip its id to
         //    `.failed`, persist for restart recovery.
         let quotedTsForSend = quoting?.ts
-        let optimistic = makeOptimisticUserMessage(text: text, quotedTs: quotedTsForSend, quotedText: quoting?.text)
+        let optimistic = makeOptimisticUserMessage(text: text, quotedTs: quotedTsForSend, quotedText: quoting?.text, quotedRole: quoting?.role)
         self.appendUnique(optimistic)
         self.sendingIds.insert(optimistic.id)
         self.localSendStartedAt[optimistic.id] = Date()
@@ -2381,7 +2390,7 @@ final class ChatViewModel: ObservableObject {
     /// optimistic bubble with the existing chat. The `localId` field carries
     /// the stable `local-<uuid>` tracking key — used by sendingIds / failedIds
     /// / pendingFailedMessages and by the `appendUnique` GRDB-skip guard.
-    private func makeOptimisticUserMessage(text: String, quotedTs: String?, quotedText: String?) -> ChatMessage {
+    private func makeOptimisticUserMessage(text: String, quotedTs: String?, quotedText: String?, quotedRole: String?) -> ChatMessage {
         let now = Date()
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -2394,6 +2403,7 @@ final class ChatViewModel: ObservableObject {
             source: "ios-app",
             quotedTs: quotedTs,
             quotedText: quotedText,
+            quotedRole: quotedRole,
             attachmentUrl: nil,
             attachmentType: nil,
             attachmentFilename: nil,
@@ -2423,10 +2433,17 @@ final class ChatViewModel: ObservableObject {
         if let q = quotedTs { payload["quoted_ts"] = q }
         req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         do {
-            let (data, _) = try await session.data(for: req)
+            let (data, response) = try await session.data(for: req)
+            // 拿到 HTTP 响应 = server 可达 (即使它拒绝了这条 send), 刷新网络成功时间给 connectionStatus.
             recordNetworkSuccess()
+            let httpStatus = (response as? HTTPURLResponse)?.statusCode ?? 0
             let decoded = try? JSONDecoder().decode(ChatSendResponse.self, from: data)
-            if let rec = decoded?.record {
+            // P0 修复 (发送可靠性): /chat/send 在 target session 不可达时正确返回 502 + ok:false,
+            // 但 body 仍带 record (供历史落库). 之前只看 record 存在就当成功 → 假成功, 不留失败态/retry.
+            // 现在三条全满足才算成功: HTTP 2xx + ok==true + record!=nil. 任一不满足都 return false,
+            // 走 send() 里现有的 failedIds / pendingFailedMessages 失败+重试逻辑 (不重造).
+            let success = (200...299).contains(httpStatus) && (decoded?.ok == true) && (decoded?.record != nil)
+            if success, let rec = decoded?.record {
                 // Replace optimistic with server-canonical record.
                 if let idx = self.messages.firstIndex(where: { $0.id == optimisticId }) {
                     self.messages.remove(at: idx)
@@ -2435,8 +2452,12 @@ final class ChatViewModel: ObservableObject {
                 reconcileLocalSendState()
                 return true
             }
-            // Server returned 200 but no record — treat as failure so the user
-            // can retry rather than silently lose the text.
+            // 非 2xx / ok:false / 无 record: 把服务端 error 写进 lastError, optimistic 气泡留失败态可重试.
+            if let serverErr = decoded?.error, !serverErr.isEmpty {
+                self.lastError = "发送失败: \(serverErr)"
+            } else {
+                self.lastError = "发送失败 (HTTP \(httpStatus))"
+            }
             return false
         } catch {
             self.lastError = "发送失败: \(error.localizedDescription)"
@@ -2803,11 +2824,19 @@ final class ChatViewModel: ObservableObject {
               let list = try? JSONDecoder().decode([ChatMessage].self, from: data),
               !list.isEmpty else { return }
         self.pendingFailedMessages = list
+        var didInsert = false
         for m in list {
             if !messages.contains(where: { $0.id == m.id }) {
                 messages.append(m)
+                didInsert = true
             }
             failedIds.insert(m.id)
+        }
+        // 5需求2 (2026-06-25): 失败消息曾被 append 到末尾, 而 displayedMessages 走 messages.suffix(visibleLimit)
+        // 不重排 → 切 tab / 重启就冒到当前堆着. 改成并入后按 ts 排回正确时间位置, 让失败气泡像正常消息一样
+        // 稳定待在它发送失败的那个时间点 (往上翻能看到), 不再堆当前. 长按重发能力 (retryFailedSend) 不变.
+        if didInsert {
+            messages.sort(by: Self.chatMessageAscending)
         }
     }
 
@@ -2856,6 +2885,7 @@ final class ChatViewModel: ObservableObject {
     nonisolated struct ChatSendResponse: Codable, Sendable {
         let ok: Bool
         let record: ChatMessage?
+        let error: String?   // P0 修复: /chat/send 502 body 带 error, 客户端拿来写 lastError
     }
 }
 
@@ -2901,6 +2931,8 @@ struct ChatView: View {
 
     var onShowFavorites: (() -> Void)? = nil
     var scrollToken: Int = 0
+    // v2.8 R3a: 长按微信顶栏昵称进终端 tab. selectedTab 是 ContentView 的 @State, 经此闭包透传上去 (ContentView 传 { selectedTab = 1 }).
+    var onEnterTerminal: () -> Void = {}
 
     private func statusColor(for status: ChatConnectionStatus) -> Color {
         switch status {
@@ -3039,7 +3071,13 @@ struct ChatView: View {
                 onChoiceSelect: { value in Task { await vm.send(text: value) } },
                 onPreviewActiveChanged: nil,
                 onEnterRP: nil,
-                onImageTap: { url in previewingImageURL = ImagePreviewURL(url: url) }
+                onImageTap: { url in previewingImageURL = ImagePreviewURL(url: url) },
+                quoteDisplayText: resolvedWechatQuoteText(for: msg, in: vm.messages),
+                onQuoteTap: {
+                    if let qts = msg.quotedTs, let target = vm.messages.first(where: { $0.ts == qts }) {
+                        Task { await vm.jumpToMessage(target) }
+                    }
+                }
             )
             .id(msg.id)
             .padding(.vertical, 4)
@@ -3054,6 +3092,7 @@ struct ChatView: View {
                 WeChatHeaderBar(
                     aiName: aiName,
                     onExit: { ThemeStore.shared.theme = .warm },
+                    onEnterTerminal: onEnterTerminal,   // v2.8 R3a: 透传 ContentView 的 { selectedTab = 1 }, 不再切 theme
                     onToggleSearch: { showSearch.toggle() },
                     onShowFavorites: onShowFavorites,
                     onClearChat: { showClearChatConfirm = true },
@@ -3817,13 +3856,17 @@ private struct ChatInputBar: View {
                 }
             }
             Button { commitFromSendButton() } label: {
-                Image(systemName: (vm.sending || commitPending) ? "ellipsis.circle" : "paperplane.fill")
+                Image(systemName: commitPending ? "ellipsis.circle" : "paperplane.fill")
                     .font(.ccSerifAdaptive(size: 20, weight: .semibold))
-                    .scaleEffect(x: (vm.sending || commitPending) ? 1 : -1, y: 1)
-                    .rotationEffect(.degrees((vm.sending || commitPending) ? 0 : -15))
+                    .scaleEffect(x: commitPending ? 1 : -1, y: 1)
+                    .rotationEffect(.degrees(commitPending ? 0 : -15))
                     .foregroundStyle(Color.ccAccent.opacity(hasContent ? 1.0 : 0.35))
             }
-            .disabled(vm.sending || commitPending)
+            // Fix (VPS feedback 2026-06-24 #2 multi in-flight): 发送按钮不再被全局 vm.sending 硬禁用,
+            // 普通文本发送不被上一条卡住 (每条 optimistic bubble 走 per-id sendingIds/failedIds 管理).
+            // 仍留 commitPending 防同一次提交双触发. 附件上传仍单飞 (picker 按钮另 gate vm.sending,
+            // 上传期间 vm.sending=true). slash command 走 send() 内 handleSlashCommand 单独路径.
+            .disabled(commitPending)
         }
         .onAppear {
             // 2026-05-10 用户 push 切 tab 不丢草稿 view 重建 onAppear 从 vm.draft init draftLocal
@@ -4177,6 +4220,8 @@ private struct WeChatHeaderBar: View {
     @ObservedObject private var nickStore = WechatNickStore.shared
     // v2.2 真机精修: 出戏口从右上「···」挪到左上返回箭头(任务5), 「···」恢复成正常微信式弹菜单(任务6).
     var onExit: () -> Void = {}
+    // 5需求3 (2026-06-25): 微信主题不渲染 tab, 没正常入口去终端. 长按顶栏昵称 = 隐藏入口, 切终端主题.
+    var onEnterTerminal: () -> Void = {}
     var onToggleSearch: () -> Void = {}
     var onShowFavorites: (() -> Void)? = nil
     var onClearChat: (() -> Void)? = nil
@@ -4189,6 +4234,12 @@ private struct WeChatHeaderBar: View {
 
     private let inkColor = Color(red: 0.094, green: 0.094, blue: 0.094)
     private var allSelected: Bool { totalCount > 0 && selectedCount == totalCount }
+
+    // v2.8: 首次进微信主题在昵称正下方弹引导气泡「长按进入终端」(替原屏中 toast, 更直观且覆盖冷启动就在微信主题).
+    // 用新 key 跟旧 toast flag (wechat_terminal_hint_shown) 隔开, 确保真机一定能首次看到气泡.
+    @AppStorage("wechat_terminal_hint_bubble_shown") private var terminalHintShown: Bool = false
+    @State private var showTerminalHint: Bool = false
+    private let hintBubbleColor = Color(red: 0.18, green: 0.18, blue: 0.20)
 
     var body: some View {
         if multiSelectMode {
@@ -4227,6 +4278,8 @@ private struct WeChatHeaderBar: View {
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(inkColor)
                 .onAppear { nickStore.refresh() }
+                // 5需求3: 长按昵称进终端 (隐藏入口). 昵称当前只 onAppear 刷新无单击交互, 长按不冲突.
+                .onLongPressGesture { dismissTerminalHint(); onEnterTerminal() }
             HStack {
                 Spacer()
                 // v2.2 任务6: 右上「···」改弹菜单, 照搬其它主题顶栏那套动作 (搜索聊天记录 / 收藏 / 清空), 不再单点切主题.
@@ -4252,6 +4305,49 @@ private struct WeChatHeaderBar: View {
                 .accessibilityLabel("更多")
             }
         }
+        .overlay(alignment: .bottom) {
+            if showTerminalHint { terminalHintBubble }
+        }
+        .onAppear {
+            guard !terminalHintShown else { return }
+            // 顶栏渲染稳定后再弹更自然; 6 秒没操作自动收起不长期挡聊天.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.78)) { showTerminalHint = true }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.7) {
+                if showTerminalHint { dismissTerminalHint() }
+            }
+        }
+    }
+
+    private func dismissTerminalHint() {
+        withAnimation(.easeOut(duration: 0.25)) { showTerminalHint = false }
+        terminalHintShown = true
+    }
+
+    // v2.8: 昵称下方引导气泡 — 上三角指着昵称 + 深灰 tooltip「长按进入终端」. 点一下或长按进终端即收起, 看过不再现.
+    private var terminalHintBubble: some View {
+        VStack(spacing: 0) {
+            Image(systemName: "arrowtriangle.up.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(hintBubbleColor)
+                .offset(y: 1)
+            HStack(spacing: 5) {
+                Image(systemName: "hand.tap.fill")
+                    .font(.system(size: 12))
+                Text("长按进入终端")
+                    .font(.system(size: 13, weight: .medium))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(hintBubbleColor, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        }
+        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+        .offset(y: 46)  // 推到顶栏下沿, 三角尖对昵称底部; 水平天然居中对准昵称. 真机可微调此值.
+        .contentShape(Rectangle())
+        .onTapGesture { dismissTerminalHint() }
+        .transition(.opacity.combined(with: .move(edge: .top)))
     }
 }
 
@@ -4673,6 +4769,12 @@ private struct ChatListView: View {
                 onPreviewActiveChanged: { active in previewActive = active },
                 onEnterRP: onEnterRP.map { cb in { cb(msg.text) } },
                 onImageTap: onImageTap,
+                quoteDisplayText: resolvedWechatQuoteText(for: msg, in: vm.messages),
+                onQuoteTap: {
+                    if let qts = msg.quotedTs, let target = vm.messages.first(where: { $0.ts == qts }) {
+                        Task { await vm.jumpToMessage(target) }
+                    }
+                },
                 sendStatus: vm.sendStatus(forId: msg.id),
                 onRetry: msg.isUser ? { vm.retryFailedSend(id: msg.id) } : nil,
                 onDiscardFailed: msg.isUser ? { vm.discardFailedSend(id: msg.id) } : nil
@@ -4680,7 +4782,10 @@ private struct ChatListView: View {
             }
             .id(msg.id)
             .padding(.vertical, 4)
-            .padding(.trailing, 12)
+            // 2026-06-25 T5 修: 微信主题下去掉这层右侧 12pt 行内边距, 否则 user 头像 = WeChatBubbleRow 内部 12pt + 这层 12pt = 距右边缘 24pt,
+            // 比 AI 头像距左边缘 12pt 宽了一倍 (用户报 "user 头像太宽"). 改成 wechat 走 0, 让两侧各靠 WeChatBubbleRow 内部 12pt 对称; 其它主题保持 12pt 零回归.
+            // (对齐 ChatView.chatRowView 已有的同款门控)
+            .padding(.trailing, ThemeStore.shared.theme == .wechat ? 0 : 12)
             .transition(.asymmetric(
                 insertion: .opacity.combined(with: .move(edge: .bottom)),
                 removal: .opacity
@@ -4887,6 +4992,7 @@ private struct ChatSeparatorRow: View {
         HStack {
             Spacer()
             Text(label)
+                .multilineTextAlignment(.center)
                 .font(themeStore.theme == .wechat
                     ? .system(size: 14)   // v2.3 任务4: 微信分隔行(day/30min)时间戳字号 12->14 贴真微信; 其它主题 11 零回归.
                     : .ccSerifAdaptive(size: 11))
@@ -4901,6 +5007,10 @@ private struct ChatSeparatorRow: View {
                 .clipShape(Capsule())
             Spacer()
         }
+        // 2026-06-25 T1 修: 此行在 LazyVStack(alignment:.leading) 里, HStack 默认只取内容宽度,
+        // 两个 Spacer 没有可撑开的剩余空间 → 文字被压到左侧没居中 (反向拍一拍"<昵称>拍了拍我<后缀>"
+        // 不对齐的根因). 显式 maxWidth:.infinity 让 HStack 占满行宽, Spacer 才能把文字真正推到居中.
+        .frame(maxWidth: .infinity)
         // v2.3 任务5: 微信分隔行上下 padding 加大 (top8/bottom4 -> top16/bottom14) 给时间戳呼吸感; 其它主题保持原值零回归.
         .padding(themeStore.theme == .wechat
             ? EdgeInsets(top: 16, leading: 12, bottom: 14, trailing: 12)
@@ -5165,12 +5275,37 @@ struct PatPatEvent: Identifiable, Hashable {
     let text: String
 }
 
+@MainActor
+private func resolvedWechatQuoteText(for message: ChatMessage, in messages: [ChatMessage]) -> String? {
+    guard let raw = message.quotedText?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+        return nil
+    }
+    let quoted = message.quotedTs.flatMap { ts in messages.first { $0.ts == ts } }
+    let role = [message.quotedRole, quoted?.role]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .first { !$0.isEmpty }
+    guard let role else { return raw }
+    let nick: String
+    if role == "user" {
+        nick = CcNameResolver.name(for: .user)
+    } else {
+        let current = WechatNickStore.shared.nick.trimmingCharacters(in: .whitespacesAndNewlines)
+        nick = current.isEmpty ? FlavorConfig.defaultWechatNick : current
+    }
+    return "\(nick): \(raw)"
+}
+
 /// 头像抖动 GeometryEffect — animatableData 0→1 时水平 sin 摆动 3 个来回 (拍一拍那种 jiggle).
 private struct PatShakeEffect: GeometryEffect {
     var animatableData: CGFloat
     func effectValue(size: CGSize) -> ProjectionTransform {
-        let dx = 5 * sin(animatableData * .pi * 3)
-        return ProjectionTransform(CGAffineTransform(translationX: dx, y: 0))
+        // v2.8: 微信拍一拍是绕中心斜着来回摇摆(像摇头), 不是水平平移. 改成 ±8° rotation 摆 3 个回合.
+        let angle = sin(animatableData * .pi * 3) * (8 * .pi / 180)
+        let cx = size.width / 2, cy = size.height / 2
+        var t = CGAffineTransform(translationX: cx, y: cy)
+        t = t.rotated(by: angle)
+        t = t.translatedBy(x: -cx, y: -cy)
+        return ProjectionTransform(t)
     }
 }
 
@@ -5178,9 +5313,15 @@ private struct WeChatBubbleRow: View {
     let message: ChatMessage
     let showTime: Bool
     var onImageTap: ((URL) -> Void)? = nil
+    var quoteDisplayText: String? = nil
+    // 5需求5 (2026-06-25): 引用块点击跳原消息. 闭包由上层 (有 vm 处) 注入.
+    var onQuoteTap: (() -> Void)? = nil
     private var isUser: Bool { message.isUser }
     // v2.6 拍一拍: 双击 AI 头像的抖动量, 0→1 触发一轮 jiggle.
     @State private var patShake: CGFloat = 0
+    // 5需求4 (2026-06-25): 微信文件气泡点击预览 (照搬其它主题 QuickLook: 远程文件先下载到 cache 再预览).
+    @State private var quickLookURL: URL? = nil
+    @State private var isDownloadingPreview: Bool = false
 
     private static let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
@@ -5231,6 +5372,10 @@ private struct WeChatBubbleRow: View {
         }
         .padding(.vertical, showTime ? 4 : 2)
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+        // 5需求4: 文件预览面板挂整行 (下载完 quickLookURL 非空即弹).
+        #if canImport(QuickLook)
+        .quickLookPreview($quickLookURL)
+        #endif
     }
 
     // v2.6 拍一拍: 对方(AI)头像双击触发. 抖动 + haptic 是本地反馈; 系统消息 + 发 ping 给对方 由 vm 接 .ccPatPat 通知做.
@@ -5249,21 +5394,28 @@ private struct WeChatBubbleRow: View {
         !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    // v2.7 A3: 微信引用消息灰底框「被引用人昵称: 内容」. WeChatBubbleRow 只在微信主题渲染, 天然门控.
+    // v2.7 A3 + 5需求5 (2026-06-25): 微信引用块「被引用人昵称: 内容」灰底框. 按真微信效果挪到主气泡【下方】
+    // (原在上方), 灰底灰字小一档圆角框, 可点击跳原消息. WeChatBubbleRow 只在微信主题渲染, 天然门控.
     @ViewBuilder
     private var bubbleContent: some View {
         VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
-            if let q = message.quotedText, !q.isEmpty {
+            mainBubbleContent
+            if let q = quoteDisplayText, !q.isEmpty {
+                // v2.8 R5: 去掉 maxWidth:260 窄限 + 左对齐死值, 引用块宽度自适应内容, 外对齐跟主气泡同侧
+                // (user 右对齐贴气泡右缘 / ai 左对齐), 靠 bubbleContent 的 VStack(alignment:) 实现; 块内文字仍左读.
+                // v2.8 R5b 真机修: 原灰底 0.93 跟微信聊天页背景 wechatBg(0.929/#EDEDED, line 186) 撞色,
+                // 引用块完全融进页底"看不见背景"。改成 0.85(#D9D9D9) 跟页底拉开层次, 阿眠真机看了可再微调深浅。
                 Text(q)
                     .font(.system(size: 13))
                     .foregroundStyle(Color(red: 0.45, green: 0.45, blue: 0.45))
+                    .multilineTextAlignment(.leading)
                     .lineLimit(3)
                     .padding(.horizontal, 10).padding(.vertical, 7)
-                    .frame(maxWidth: 260, alignment: .leading)
-                    .background(Color(red: 0.93, green: 0.93, blue: 0.93))
+                    .background(Color(red: 0.85, green: 0.85, blue: 0.85))
                     .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .contentShape(Rectangle())
+                    .onTapGesture { onQuoteTap?() }
             }
-            mainBubbleContent
         }
     }
 
@@ -5320,6 +5472,14 @@ private struct WeChatBubbleRow: View {
         .frame(maxWidth: 280)   // v2.3 任务2: 文件卡片气泡宽度 220->280 贴真微信
         .background(Color.white)
         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        // 5需求4: 点击文件卡片预览. user/ai 两侧都走 wechatFileCard, 天然双向. 远程文件下载完 set quickLookURL 触发.
+        .contentShape(Rectangle())
+        .overlay { if isDownloadingPreview { ProgressView().controlSize(.small) } }
+        .onTapGesture {
+            if let url = message.attachmentFullURL() {
+                openWeChatFilePreview(remoteURL: url, filename: message.attachmentFilename ?? "附件")
+            }
+        }
     }
 
     private var textBubble: some View {
@@ -5359,6 +5519,38 @@ private struct WeChatBubbleRow: View {
         default: return "doc.fill"
         }
     }
+
+    // 5需求4 (2026-06-25): 微信文件预览下载逻辑 (照搬 ChatBubble.openWithQuickLook/downloadToCache).
+    // WeChatBubbleRow 是独立 struct 用不了 ChatBubble 的私有方法, 复制一份本地用; cache 目录/命名同款故共享不重下.
+    private func openWeChatFilePreview(remoteURL: URL, filename: String) {
+        guard !isDownloadingPreview else { return }
+        isDownloadingPreview = true
+        Task {
+            let localURL = await downloadWeChatPreview(remoteURL: remoteURL, filename: filename)
+            await MainActor.run {
+                isDownloadingPreview = false
+                quickLookURL = localURL
+            }
+        }
+    }
+
+    private func downloadWeChatPreview(remoteURL: URL, filename: String) async -> URL? {
+        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let previewDir = cachesDir.appendingPathComponent("cc_preview", isDirectory: true)
+        try? FileManager.default.createDirectory(at: previewDir, withIntermediateDirectories: true)
+        let safeName = "\(abs(remoteURL.absoluteString.hashValue))_\(filename)"
+        let localURL = previewDir.appendingPathComponent(safeName)
+        if FileManager.default.fileExists(atPath: localURL.path) { return localURL }
+        do {
+            let (tmpURL, _) = try await URLSession.shared.download(from: remoteURL)
+            try? FileManager.default.removeItem(at: localURL)
+            try FileManager.default.moveItem(at: tmpURL, to: localURL)
+            return localURL
+        } catch {
+            print("[WeChatBubbleRow] preview download fail: \(error)")
+            return nil
+        }
+    }
 }
 
 private struct ChatMessageListRow: View {
@@ -5381,6 +5573,8 @@ private struct ChatMessageListRow: View {
     let onPreviewActiveChanged: ((Bool) -> Void)?
     let onEnterRP: (() -> Void)?
     var onImageTap: ((URL) -> Void)? = nil
+    var quoteDisplayText: String? = nil
+    var onQuoteTap: (() -> Void)? = nil   // 5需求5: 引用块点击跳原消息 (透传给 WeChatBubbleRow)
     // 2026-05-12 optimistic-send
     var sendStatus: SendStatus = .sent
     var onRetry: (() -> Void)? = nil
@@ -5406,7 +5600,7 @@ private struct ChatMessageListRow: View {
                     .padding(.leading, 12)
             }
             // v2.2 任务7: 微信主题别砍长按菜单, 把跟其它主题一致的长按气泡菜单原样挂到伪装行上.
-            WeChatBubbleRow(message: message, showTime: showTime, onImageTap: onImageTap)
+            WeChatBubbleRow(message: message, showTime: showTime, onImageTap: onImageTap, quoteDisplayText: quoteDisplayText, onQuoteTap: onQuoteTap)
         }
         #if !targetEnvironment(macCatalyst)
         .contentShape(Rectangle())

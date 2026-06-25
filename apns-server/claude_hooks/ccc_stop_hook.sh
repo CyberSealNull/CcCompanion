@@ -134,14 +134,24 @@ if [ -z "$LAST_ASSISTANT" ]; then
 fi
 
 # POST 到 /chat/append
-PAYLOAD=$(ASSISTANT_TEXT="$LAST_ASSISTANT" python3 -c '
-import json, os, datetime
+# Fix (VPS feedback 2026-06-24 #4 dedup): every stop-hook POST carries a unique client_msg_id
+# so the server dedupes on the cmid key, not on content. Without it two identical short replies
+# (e.g. two "Got it.") within the fallback window collided and the second was dropped. The id is
+# generated ONCE here and reused across the retry loop below, so transient-error retries still
+# dedupe to the same record while genuinely separate turns each get their own id. uuid4().hex is
+# Linux/macOS portable — no dependency on `uuidgen` being installed.
+PAYLOAD=$(ASSISTANT_TEXT="$LAST_ASSISTANT" TRANSCRIPT_PATH="$TRANSCRIPT_PATH" python3 -c '
+import json, os, datetime, uuid, hashlib
 ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+_tp = os.environ.get("TRANSCRIPT_PATH", "")
+_sess = hashlib.sha1(_tp.encode("utf-8")).hexdigest()[:8] if _tp else "nosess"
+client_msg_id = f"stop-hook-{_sess}-{uuid.uuid4().hex}"
 print(json.dumps({
     "role": "assistant",
     "text": os.environ["ASSISTANT_TEXT"],
     "source": "ccc-stop-hook",
     "ts": ts,
+    "client_msg_id": client_msg_id,
 }))
 ')
 

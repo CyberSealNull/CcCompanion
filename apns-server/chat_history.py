@@ -81,6 +81,8 @@ class ChatHistory:
         location: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         turn_id: str | None = None,
+        sticker_id: str | None = None,
+        patpat: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         rec: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
@@ -95,9 +97,12 @@ class ChatHistory:
             rec["turn_id"] = turn_id
         if quoted_ts:
             rec["quoted_ts"] = quoted_ts
-            quoted_text = self._lookup_text(quoted_ts)
-            if quoted_text is not None:
-                rec["quoted_text"] = quoted_text[:120]
+            quoted = self._lookup_record(quoted_ts)
+            if quoted is not None:
+                rec["quoted_text"] = str(quoted.get("text", ""))[:120]
+                role = str(quoted.get("role", "")).strip()
+                if role:
+                    rec["quoted_role"] = role
         if attachment_url:
             rec["attachment_url"] = attachment_url
         if attachment_type:
@@ -110,6 +115,10 @@ class ChatHistory:
                 rec["location"] = loc_clean
         if metadata and isinstance(metadata, dict):
             rec["metadata"] = metadata
+        if sticker_id:
+            rec["sticker_id"] = str(sticker_id).strip()
+        if patpat and isinstance(patpat, dict):
+            rec["patpat"] = patpat
         with self._lock:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -188,6 +197,12 @@ class ChatHistory:
         return self.update_audio(ts, audio_zh=audio_url)
 
     def _lookup_text(self, ts: str) -> str | None:
+        rec = self._lookup_record(ts)
+        if rec is None:
+            return None
+        return rec.get("text", "")
+
+    def _lookup_record(self, ts: str) -> dict[str, Any] | None:
         if not self.path.exists():
             return None
         with self.path.open("r", encoding="utf-8") as f:
@@ -197,7 +212,7 @@ class ChatHistory:
                 except Exception:
                     continue
                 if rec.get("ts") == ts:
-                    return rec.get("text", "")
+                    return rec
         return None
 
     def read_since(self, since_ts: str | None = None, before_ts: str | None = None, limit: int = 10000, include_hidden: bool = False) -> list[dict[str, Any]]:
