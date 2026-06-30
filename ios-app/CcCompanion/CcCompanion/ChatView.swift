@@ -1073,6 +1073,7 @@ final class ChatViewModel: ObservableObject {
     private var lastTs: String? = nil
     private var settingsEtag: String? = nil
     private var pollingFailureCount: Int = 0
+    private var streamFailureCount: Int = 0
     private var appIsActive: Bool = true
     private var notifyOnPollingAssistant: Bool {
         UserDefaults.standard.object(forKey: "notify_on_polling_assistant") as? Bool ?? true
@@ -1082,6 +1083,13 @@ final class ChatViewModel: ObservableObject {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 12
         cfg.timeoutIntervalForResource = 20
+        return URLSession(configuration: cfg)
+    }()
+    // 2026-06-30 SSE: 长连接专用 session, resource timeout 设 7 天 (SSE 不能被 20s 掐断)
+    private let streamSession: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 30
+        cfg.timeoutIntervalForResource = 7 * 24 * 60 * 60
         return URLSession(configuration: cfg)
     }()
 
@@ -1111,17 +1119,18 @@ final class ChatViewModel: ObservableObject {
                 }
             }
             _ = notifTask
-            while !Task.isCancelled {
-                let delay = self?.pollDelaySeconds() ?? 5
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                if Task.isCancelled { break }
-                await self?.pollOnce()
-            }
+            await self?.runRealtimeLoop()
         }
     }
 
     func setPollingActive(_ active: Bool) {
         appIsActive = active
+        if active {
+            if pollingTask == nil { start() }
+        } else {
+            pollingTask?.cancel()
+            pollingTask = nil
+        }
     }
 
     private func pollDelaySeconds() -> Int {
@@ -1136,29 +1145,111 @@ final class ChatViewModel: ObservableObject {
             let response = try await ChatNetworkClient.shared.fetchPoll(since: lastTs, etag: settingsEtag)
             recordNetworkSuccess()
             pollingFailureCount = 0
-            isCcTyping = response.status.isTyping ?? (response.status.status == "typing")
-            ccStatus = response.status.status
-            if let etag = response.settings.etag { settingsEtag = etag }
-            if response.settings.unchanged != true, let values = response.settings.values {
-                chatSoundEnabled = values["chat_sound_enabled"] ?? chatSoundEnabled
-                taskSoundEnabled = values["task_sound_enabled"] ?? taskSoundEnabled
-            }
-            if !response.chat.newRecords.isEmpty {
-                let existingIds = Set(messages.map(\.id))
-                chatStore.upsert(response.chat.newRecords)
-                mergeUnique(response.chat.newRecords)
-                notifyPollingAssistantMessages(response.chat.newRecords, existingIds: existingIds)
-                reconcileLocalSendState()
-                await refreshRecent()
-                fetchThinkingForNewTurns(response.chat.newRecords)
-                lastError = nil
-            } else if let last = response.chat.lastTs, (lastTs ?? "") < last {
-                lastTs = last
-                reconcileLocalSendState()
-            }
+            await applyRealtimeResponse(response)
         } catch {
             pollingFailureCount += 1
             objectWillChange.send()
+        }
+    }
+
+    // 2026-06-30 SSE Phase1: SSE 优先实时循环, 失败累计 3 次降级 poll 窗口, 指数退避重连
+    private func runRealtimeLoop() async {
+        while !Task.isCancelled {
+            guard appIsActive else {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                continue
+            }
+            if streamFailureCount >= 3 {
+                await runPollingFallbackWindow()
+                streamFailureCount = 0
+                continue
+            }
+            do {
+                try await streamOnce()
+                if Task.isCancelled { break }
+                streamFailureCount += 1
+            } catch {
+                if Task.isCancelled { break }
+                streamFailureCount += 1
+                pollingFailureCount = streamFailureCount
+                objectWillChange.send()
+            }
+            let delay = min(15, 1 << min(streamFailureCount, 4))
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+    }
+
+    // SSE 不可用 (server 无 /chat/stream 或断流) 时的降级窗口: 最多 10 tick poll 兜底, 不删 poll 端点 (容灾逃生口)
+    private func runPollingFallbackWindow() async {
+        var ticks = 0
+        while !Task.isCancelled, appIsActive, ticks < 10 {
+            await pollOnce()
+            ticks += 1
+            let delay = pollDelaySeconds()
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+    }
+
+    // SSE 优先: GET /chat/stream 逐行解析 data: 事件; server 没这端点 (公版用户未更新 server) 抛错走降级 poll
+    private func streamOnce() async throws {
+        sweepStaleThinkingPlaceholders()
+        var components = URLComponents(
+            url: CcServerConfig.serverURL.appendingPathComponent("chat/stream"),
+            resolvingAgainstBaseURL: false
+        )
+        var items = [URLQueryItem(name: "limit", value: "50")]
+        if let lastTs { items.append(URLQueryItem(name: "since", value: lastTs)) }
+        if let settingsEtag { items.append(URLQueryItem(name: "etag", value: settingsEtag)) }
+        components?.queryItems = items
+        guard let finalURL = components?.url else { throw URLError(.badURL) }
+        var request = CcServerConfig.authenticatedRequest(url: finalURL)
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 60
+
+        let (bytes, response) = try await streamSession.bytes(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw ChatNetworkError.invalidResponse
+        }
+        let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
+        guard contentType.contains("text/event-stream") else {
+            throw ChatNetworkError.invalidResponse
+        }
+        streamFailureCount = 0
+        pollingFailureCount = 0
+        recordNetworkSuccess()
+
+        for try await line in bytes.lines {
+            if Task.isCancelled { break }
+            if line.hasPrefix(":") || line.isEmpty { continue }
+            guard line.hasPrefix("data:") else { continue }
+            let raw = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+            guard let data = raw.data(using: .utf8) else { continue }
+            let decoded = try JSONDecoder().decode(ChatPollResponse.self, from: data)
+            await applyRealtimeResponse(decoded)
+        }
+    }
+
+    // poll / SSE 共用的 response 应用逻辑 (从 pollOnce 抽出, 两条路径都走这里)
+    private func applyRealtimeResponse(_ response: ChatPollResponse) async {
+        isCcTyping = response.status.isTyping ?? (response.status.status == "typing")
+        ccStatus = response.status.status
+        if let etag = response.settings.etag { settingsEtag = etag }
+        if response.settings.unchanged != true, let values = response.settings.values {
+            chatSoundEnabled = values["chat_sound_enabled"] ?? chatSoundEnabled
+            taskSoundEnabled = values["task_sound_enabled"] ?? taskSoundEnabled
+        }
+        if !response.chat.newRecords.isEmpty {
+            let existingIds = Set(messages.map(\.id))
+            chatStore.upsert(response.chat.newRecords)
+            mergeUnique(response.chat.newRecords)
+            notifyPollingAssistantMessages(response.chat.newRecords, existingIds: existingIds)
+            reconcileLocalSendState()
+            await refreshRecent()
+            fetchThinkingForNewTurns(response.chat.newRecords)
+            lastError = nil
+        } else if let last = response.chat.lastTs, (lastTs ?? "") < last {
+            lastTs = last
+            reconcileLocalSendState()
         }
     }
 
@@ -3008,12 +3099,6 @@ struct ChatView: View {
         }
     }
 
-    private func handleSpeechTranscriptChange(_ newValue: String) {
-        if speech.isRecording {
-            vm.draft = newValue
-        }
-    }
-
     private func toggleAllDisplayedSelection() {
         if vm.selectedTs.count == vm.selectableDisplayedMessages.count {
             vm.selectedTs.removeAll()
@@ -3727,7 +3812,7 @@ private struct ChatInputBar: View {
                 .submitLabel(.send)
                 .onSubmit { commitFromSubmit() }
                 .onChange(of: draftLocal) { oldValue, newValue in
-                    vm.draft = newValue
+                    // 2026-06-30 打字卡解耦: 删每字符 vm.draft 写回 (触发 displayedMessages 全列表重渲), draft 改 view-local
                     if newValue.hasSuffix("\n") && !oldValue.hasSuffix("\n") {
                         draftLocal = String(newValue.dropLast())
                         commitFromSubmit()
@@ -3804,7 +3889,7 @@ private struct ChatInputBar: View {
                         commitFromSubmit()
                     }
                     .onChange(of: draftLocal) { oldValue, newValue in
-                        vm.draft = newValue
+                        // 2026-06-30 打字卡解耦: 删每字符 vm.draft 写回, draft 改 view-local
                         if newValue.hasSuffix("\n") && !oldValue.hasSuffix("\n") {
                             if slashPopoverVisible, slashCandidates.indices.contains(slashHighlightIndex) {
                                 draftLocal = String(newValue.dropLast())

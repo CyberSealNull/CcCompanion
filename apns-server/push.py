@@ -31,7 +31,7 @@ POST /push 触发 SPOKE / 状态切换 等
 from __future__ import annotations
 
 import argparse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import hashlib
 import ipaddress
 import json
@@ -85,6 +85,33 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("cc-apns-server")
+
+
+class ChatEventBus:
+    """Small SSE fan-out bus for /chat/stream subscribers."""
+
+    def __init__(self):
+        self._subscribers: list[deque[dict[str, Any]]] = []
+        self._lock = threading.Lock()
+
+    def subscribe(self) -> deque[dict[str, Any]]:
+        q: deque[dict[str, Any]] = deque(maxlen=500)
+        with self._lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: deque[dict[str, Any]]):
+        with self._lock:
+            try:
+                self._subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def publish(self, event: dict[str, Any]):
+        with self._lock:
+            subs = list(self._subscribers)
+        for q in subs:
+            q.append(event)
 
 
 # P0-3: auto-generate and persist shared_secret if not configured
@@ -356,6 +383,7 @@ class ServerState:
         self.calendar = CalendarStore(calendar_path)
         self.rp_history = RPHistory("/tmp")
         self.task_buffer = EphemeralTaskBuffer(capacity=100)
+        self.chat_bus = ChatEventBus()
         # Handy-Clawd pet state (2026-05-08 用户 push)
         from pet_state import PetState, PetStateBus, PetBubbleBus, PetActivityBus
         pet_state_path = Path(self.token_store_path).parent / "pet_state.json"
@@ -490,6 +518,12 @@ class PushHandler(BaseHTTPRequestHandler):
 
     server_version = "CcAPNsServer/0.1"
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def log_message(self, format: str, *args):
         logger.info("%s %s", self.address_string(), format % args)
 
@@ -582,6 +616,9 @@ class PushHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/chat/history"):
             self._handle_chat_history()
+            return
+        if self.path.startswith("/chat/stream"):
+            self._handle_chat_stream()
             return
         if self.path.startswith("/v1/thinking"):
             self._handle_thinking_get()
@@ -1153,6 +1190,7 @@ class PushHandler(BaseHTTPRequestHandler):
         elif self.path == "/settings":
             for k, v in body.items():
                 self.state.settings.set(k, v)
+            self._publish_chat_status("settings")
             self._send_json(200, {"ok": True, "settings": self.state.settings.snapshot()})
             return
         else:
@@ -1447,10 +1485,11 @@ class PushHandler(BaseHTTPRequestHandler):
                     title = active.get("title", "")
                     total = active.get("total", 0)
                     if title:
-                        self.state.task_buffer.append(
+                        rec = self.state.task_buffer.append(
                             text=f"▷ 开始 {title} (0/{total})",
                             source="system",
                         )
+                        self._publish_chat_records([rec], reason=f"task/{action}")
                 elif action == "progress":
                     active = snap.get("active") or {}
                     title = active.get("title", "")
@@ -1458,29 +1497,32 @@ class PushHandler(BaseHTTPRequestHandler):
                     total = active.get("total", 0)
                     step = active.get("step", "") or ""
                     if title and step:
-                        self.state.task_buffer.append(
+                        rec = self.state.task_buffer.append(
                             text=f"· {step} ({current}/{total})",
                             source="system",
                         )
+                        self._publish_chat_records([rec], reason=f"task/{action}")
                 elif action == "done":
                     completed = snap.get("completed", []) or []
                     last = completed[-1] if completed else None
                     title = last.get("title", "") if last else ""
                     total = last.get("total", 0) if last else 0
                     if title:
-                        self.state.task_buffer.append(
+                        rec = self.state.task_buffer.append(
                             text=f"✓ 完成 {title} ({total}/{total})",
                             source="system",
                         )
+                        self._publish_chat_records([rec], reason=f"task/{action}")
                 elif action == "cancel":
                     completed = snap.get("completed", []) or []
                     last = completed[-1] if completed else None
                     title = last.get("title", "") if last else ""
                     if title:
-                        self.state.task_buffer.append(
+                        rec = self.state.task_buffer.append(
                             text=f"✗ 取消 {title}",
                             source="system",
                         )
+                        self._publish_chat_records([rec], reason=f"task/{action}")
             except Exception as e:
                 logger.warning("task → chat history fail: %s", e)
 
@@ -1493,6 +1535,7 @@ class PushHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "text required"})
             return
         rec = self.state.task_buffer.append(text=text, source=source)
+        self._publish_chat_records([rec], reason="task/append-ephemeral")
         self._send_json(200, {"ok": True, "record": rec})
 
     def _auto_push_from_task(self, snap: dict[str, Any], action: str):
@@ -1752,6 +1795,48 @@ class PushHandler(BaseHTTPRequestHandler):
             return {"unchanged": True, "etag": etag}
         return {"unchanged": False, "etag": etag, "values": snap}
 
+    def _chat_delta_records(self, since: str | None, limit: int) -> list[dict[str, Any]]:
+        chat_records = self.state.chat.read_since(since_ts=since, limit=limit)
+        task_records = self.state.task_buffer.list_since(since_ts=since)
+        return sorted(chat_records + task_records, key=lambda r: r.get("ts", ""))
+
+    def _chat_poll_payload(
+        self,
+        since: str | None,
+        etag: str | None,
+        limit: int,
+        records: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if records is None:
+            records = self._chat_delta_records(since=since, limit=limit)
+        last_ts = records[-1].get("ts") if records else since
+        now = datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
+        return {
+            "ok": True,
+            "now": now,
+            "chat": {
+                "new_records": records,
+                "last_ts": last_ts,
+                "count": len(records),
+            },
+            "status": self._chat_status_payload(),
+            "settings": self._settings_payload(etag),
+        }
+
+    def _publish_chat_records(self, records: list[dict[str, Any]], reason: str = "chat"):
+        if not records:
+            return
+        try:
+            self.state.chat_bus.publish({"records": records, "reason": reason})
+        except Exception as e:
+            logger.warning("chat_bus publish records fail reason=%s err=%s", reason, e)
+
+    def _publish_chat_status(self, reason: str = "status"):
+        try:
+            self.state.chat_bus.publish({"records": [], "reason": reason})
+        except Exception as e:
+            logger.warning("chat_bus publish status fail reason=%s err=%s", reason, e)
+
     def _handle_chat_poll(self):
         qs = self._query()
         since = self._query_value(qs, "since")
@@ -1762,28 +1847,88 @@ class PushHandler(BaseHTTPRequestHandler):
             limit = 50
         limit = max(1, min(limit, 200))
         try:
-            chat_records = self.state.chat.read_since(since_ts=since, limit=limit)
-            task_records = self.state.task_buffer.list_since(since_ts=since)
-            records = sorted(chat_records + task_records, key=lambda r: r.get("ts", ""))
-            last_ts = records[-1].get("ts") if records else since
-            now = datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
-            self._send_json(
-                200,
-                {
-                    "ok": True,
-                    "now": now,
-                    "chat": {
-                        "new_records": records,
-                        "last_ts": last_ts,
-                        "count": len(records),
-                    },
-                    "status": self._chat_status_payload(),
-                    "settings": self._settings_payload(etag),
-                },
-            )
+            self._send_json(200, self._chat_poll_payload(since=since, etag=etag, limit=limit))
         except Exception as e:
             logger.exception("chat poll fail")
             self._send_json(500, {"error": str(e)})
+
+    def _handle_chat_stream(self):
+        """GET /chat/stream — SSE replacement for 1s /chat/poll."""
+        qs = self._query()
+        since = self._query_value(qs, "since")
+        etag = self._query_value(qs, "etag")
+        try:
+            limit = int(self._query_value(qs, "limit", "50") or "50")
+        except Exception:
+            limit = 50
+        limit = max(1, min(limit, 200))
+
+        q = self.state.chat_bus.subscribe()
+        try:
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+            def write_data(payload: dict[str, Any]) -> bool:
+                try:
+                    data = json.dumps(payload, ensure_ascii=False)
+                    self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    return True
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return False
+                except Exception:
+                    logger.exception("chat stream write data fail")
+                    return False
+
+            def write_heartbeat() -> bool:
+                try:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    return True
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return False
+                except Exception:
+                    logger.exception("chat stream heartbeat fail")
+                    return False
+
+            client_since = since
+            snapshot = self._chat_poll_payload(since=client_since, etag=etag, limit=limit)
+            if not write_data(snapshot):
+                return
+            client_since = snapshot.get("chat", {}).get("last_ts") or client_since
+            last_heartbeat = time.monotonic()
+            while True:
+                wrote = False
+                while q:
+                    event = q.popleft()
+                    records = event.get("records") or []
+                    payload = self._chat_poll_payload(
+                        since=client_since,
+                        etag=etag,
+                        limit=limit,
+                        records=records,
+                    )
+                    if not write_data(payload):
+                        return
+                    client_since = payload.get("chat", {}).get("last_ts") or client_since
+                    wrote = True
+                now = time.monotonic()
+                if now - last_heartbeat >= 15.0:
+                    if not write_heartbeat():
+                        return
+                    last_heartbeat = now
+                    wrote = True
+                if not wrote:
+                    time.sleep(0.3)
+        finally:
+            self.state.chat_bus.unsubscribe(q)
 
     def _handle_timeline(self):
         qs = self._query()
@@ -3203,7 +3348,7 @@ class PushHandler(BaseHTTPRequestHandler):
         import os
         from datetime import datetime as _dt
         try:
-            archive_dir = "/Users/mian/Library/Developer/Xcode/Archives"
+            archive_dir = os.path.expanduser("~/Library/Developer/Xcode/Archives")
             latest_mtime = 0.0
             latest_path = ""
             if os.path.exists(archive_dir):
@@ -3306,6 +3451,7 @@ class PushHandler(BaseHTTPRequestHandler):
                     injected = f"{injected}\n{text}"
         # set typing — assistant 收到 message 在 thinking
         self.state.typing_state = {"is_typing": True, "since": rec["ts"]}
+        self._publish_chat_records([rec], reason="chat/send")
         # 注入文本到 active tmux session.
         # 不依赖 ~/scripts/bus_send.py (内部多 agent 协调 file, 公开版用户没有); 存在就走 bus
         # dispatcher 路由, 不存在 fallback 直接 tmux paste-buffer + send-keys (公开版默认).
@@ -3433,6 +3579,7 @@ class PushHandler(BaseHTTPRequestHandler):
         text = f"{nick}拍了拍我{suffix}"
         patpat = {"from": "ai", "suffix": suffix, "nick": nick}
         rec = self.state.chat.append(role="assistant", text=text, source="ios-app", patpat=patpat)
+        self._publish_chat_records([rec], reason="chat/patpat")
         try:
             self._send_chat_notification(nick, text)
         except Exception as e:
@@ -3780,6 +3927,7 @@ class PushHandler(BaseHTTPRequestHandler):
 
         # set typing
         self.state.typing_state = {"is_typing": True, "since": _dt.now().isoformat(timespec="milliseconds")}
+        self._publish_chat_status("chat/regenerate")
 
         # 注入 regenerate 文本到 active session — 走 _inject_to_session helper
         # ccc 公开用户没 ~/scripts/bus_send.py 时 fallback 直接 tmux 注入
@@ -3819,6 +3967,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "text required"})
                 return
             rec = self.state.task_buffer.append(text=text, source=body.get("source", "system"))
+            self._publish_chat_records([rec], reason="chat/append-task")
             self._send_json(200, {"ok": True, "record": rec})
             return
 
@@ -3988,6 +4137,7 @@ class PushHandler(BaseHTTPRequestHandler):
         # 我刚 reply 完 — typing = false
         if role == "assistant":
             self.state.typing_state = {"is_typing": False, "since": None}
+        self._publish_chat_records([rec], reason="chat/append")
 
         # 5-7 dedupe cache 回填真 rec
         if dedupe_cache_key is not None:
@@ -4164,6 +4314,7 @@ class PushHandler(BaseHTTPRequestHandler):
                 })
                 return
 
+        self._publish_chat_records([rec], reason="chat/upload")
         self._send_json(200, {"ok": True, "record": rec})
 
     def _handle_group_upload(self):
