@@ -1,65 +1,95 @@
 # CcCompanion
 
-> Bring **Claude Code** to your iPhone. Open-source iOS client + tiny Python push server. Runs entirely on your own Mac and your own phone.
+> **Claude Code** in your pocket. A full-featured open-source iOS client + a computer-side push server (runs on macOS / Windows WSL2 / Linux·VPS): chat, handheld terminal, slash-command panel, voice input, favorites, multi-agent group view, and a complete WeChat-style theme — the Claude Code running on your computer, with you around the clock. Runs entirely on your own devices. No third-party servers.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Not affiliated with Anthropic.** "Claude" and "Claude Code" are trademarks of Anthropic, PBC. See [`DISCLAIMER.md`](DISCLAIMER.md).
+**Not affiliated with Anthropic.** "Claude" and "Claude Code" are trademarks of Anthropic PBC. See [`DISCLAIMER.md`](DISCLAIMER.md).
 
-中文: [README.md](README.md)
+中文版: [README.md](README.md)
 
 ---
 
-## What this is
+## What is this
 
-CcCompanion is two halves:
+CcCompanion has two parts:
 
-1. **`ios-app/`** — a SwiftUI iOS app (TestFlight + soon App Store) that gives you a chat, terminal, and slash-command interface to your Mac's Claude Code from anywhere your iPhone is online.
-2. **`apns-server/`** — a small Python HTTP server you run on your Mac. It forwards your chat messages to a local `tmux` session running `claude`, captures the reply, and pushes it back to your iPhone via Apple Push Notifications (or [Bark](https://github.com/Finb/Bark) as a zero-Apple-Developer-required fallback).
+1. **`ios-app/`** — a SwiftUI iOS app (TestFlight invite-only for now, App Store later) that gives you chat / terminal / slash commands on your iPhone, connected to the Claude Code session on your computer over an overlay network — works from anywhere.
+2. **`apns-server/`** — a Python HTTP service on your computer (natively on macOS, inside WSL2 on Windows, or on a Linux / VPS host) that forwards your chat to the local `claude` running in `tmux`, captures replies, and pushes them back to your iPhone via Apple Push.
 
-The whole thing is **local-first** — your messages never go through our server. There is no "our server." Your Mac at home talks to your iPhone over Tailscale / ZeroTier / LAN.
+The whole thing is **local-first** — your messages never touch our server, because there is no "our server". Your computer and your iPhone talk directly over Tailscale / ZeroTier / LAN.
 
-## Features
+## What it can do
 
-- **Chat** — send a message from iPhone, see Claude Code's reply land back. Streaming, history, search, jump-to-message, favorites, attachments (image / file).
-- **Thinking cards** (build 231+) — an expandable card above each reply showing a live summary of Claude's reasoning: what it considered, how it broke down your question. Small one-time setup, see [`docs/THINKING_CARD_SETUP.md`](docs/THINKING_CARD_SETUP.md).
-- **Terminal** — inline view of the `tmux` session running `claude` on your Mac. Tap to expand. Useful for "what did claude just do?" without unlocking the Mac.
-- **Slash commands** — `/new`, `/list`, `/switch <sid>`, `/stop`, `/compact`, `/clear`, `/help`. Multi-session aware.
-- **Multi-endpoint** — chain multiple server URLs (Tailscale `100.x` + LAN `10.x` + localhost) with auto-fallback ping. Travel between networks, the app picks the live one.
-- **Polling local notifications**: when polling receives a new assistant message, the app can fire a local iOS notification for glasses and other accessories that only mirror local notifications. This is on by default and can be disabled in Settings.
-- **Remote APNs push**: build 213+ can receive server-side APNs alerts while the app is fully backgrounded or the phone is locked, provided the app bundle has Push Notifications enabled and the Mac server is configured with APNs credentials. Build 212 and earlier only provide in-app polling plus local notifications.
-- **Experimental feature flags**: new or risky app features ship behind Settings toggles first. The workgroup view is off by default and can be enabled from Settings.
-- **Onboarding wizard** — 6-step setup on first launch (server URL + secret + avatars + name + ping test).
-- **Theme** — light / dark / warm, optionally follow system.
-- **Privacy** — server `config.toml` is `.gitignore`-d, `.p8` keys live in `apns-server/secrets/` (also ignored). The repo ships with `config.example.toml` only.
+**Chat, the complete kind:**
 
-## Requirements
+- **Chat** — send from iPhone, get Claude Code's replies pushed back. Streaming, full history, full-text search, jump to any message.
+- **Voice input** — hold to talk, on-device speech recognition, no typing on your commute.
+- **Attachments** — send images / files to Claude Code; toss it a screenshot and let it look.
+- **Favorites** — one-tap save for answers that matter, browsable on their own page.
+- **Stickers** — a built-in sticker panel, because chatting with your AI can have memes too.
+- **Slash-command panel** — `/new`, `/list`, `/switch <sid>`, `/stop`, `/compact`, `/clear`, `/help` in a popover, no memorizing. Multi-session follows the current active one.
 
-- macOS 14 (Sonoma) or newer, with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and a working Anthropic Pro / Max subscription.
-- iPhone running iOS 18+.
-- One of: Tailscale, ZeroTier, or just LAN (if your iPhone is on the same Wi-Fi).
-- Optionally: an Apple Developer account if you want native APNs. Skip it and [Bark](https://github.com/Finb/Bark) covers the push channel.
-- **Xcode 16.3 or newer** (Swift tools 6.1+) to build the iOS app from source. Earlier Xcode versions may fail to resolve GRDB 7.10.0. If you are on Xcode ≤ 16.2, install via TestFlight instead of building from source.
+**Your computer, in your palm:**
+
+- **Terminal** — an embedded view of the `tmux` session running `claude` on your computer; watch what it's doing in real time, type commands from the input bar, with a keyboard toolbar for arrow keys / Enter / Esc / Ctrl-C — interactive panels like `/model` work just like sitting at your desk. No need to go unlock the computer.
+- **Multi-endpoint** — configure several server URLs in one app (Tailscale `100.x` + LAN `10.x` + localhost); it pings and switches to whichever is alive. Follows you across wifi changes.
+
+**Multi-agent & personalization:**
+
+- **Group view** — if your computer runs multiple collaborating agents (the server's group endpoints), the app has a group-chat screen to watch them talk, with in-group search and favorites. Experimental, enable in Settings.
+- **WeChat-style theme** — a full skin: chat bubbles, a moments-style timeline page, and a custom nickname for your AI. Change the skin, change the relationship.
+- **Themes** — light / dark / warm, can follow the system.
+- **Avatars & identity** — set avatars for the AI and yourself (with cropping), pick names; a 6-step onboarding wizard (server URL + secret + avatar + name + ping test).
+
+**Notifications & updates:**
+
+- **Polling local notifications** — when polling picks up a new assistant message, the app fires a local iOS notification. Works while the app is foregrounded / within background-refresh windows, and requires no Apple Developer credentials. On by default, can be turned off in Settings.
+- **Remote APNs push** — build 213+ supports server-side APNs push, so you get notified even when the app is fully backgrounded or the phone is locked. Requires the app bundle to have Push Notifications enabled and the computer-side server configured with APNs credentials (needs an Apple Developer account, see below).
+- **What's New** — per-version release notes right inside the app.
+- **Experimental feature flags** — new or risky features ship behind Settings toggles, off by default. Upgrades never disrupt existing users; the curious flip the switch themselves.
+
+**The baseline:**
+
+- **Privacy, local-first** — conversation content never leaves your devices. `config.toml` and `.p8` are `.gitignore`-d; the repo only ships a `config.example.toml` template. You run your server, your Claude Code — this project is just the UI and the pipe.
+
+## Roadmap (in development, not shipped yet)
+
+The items below are being worked on and are **not in the current version**. They're listed so you know where this is going — not so you go hunting for them in Settings:
+
+- **Multi-session** — multiple chat windows in a session list, each connected to its own backend.
+- **Direct API sessions** — the app talks to a model directly with your own API key, no computer in the loop (configurable base URL, proxy-friendly). Keys live only in the iOS Keychain, transcripts stay on the phone — it keeps working when your computer is off or offline. The escape hatch of the whole system.
+- **In-app effort switching** — no more typing commands in the terminal for this.
+- **One-shot installer** — paste the same single command on macOS or Windows (WSL2); it clones the repo, installs dependencies, generates config, sets up auto-start, runs a health check, and prints the URL + secret your iPhone needs — plus a `ccc-update` command for one-line upgrades. Once it ships, Quick start below will lead with it.
+- **Bark push integration** — lock-screen push for users without an Apple Developer account ([Bark](https://github.com/Finb/Bark) is free and open source). **Erratum**: earlier versions of this README described Bark fallback as an existing feature; the server-side integration had not actually landed. The docs got ahead of the code — this revision corrects that, with apologies to anyone who went looking for the bark config section. Until it lands, use "polling local notifications" above.
+
+When these ship we'll update the README and the TestFlight release notes. Until then, this section is the source of truth.
+
+## What you need
+
+- macOS 14 (Sonoma) or newer, **or Windows (via WSL2, see [`docs/SETUP_WIN_WSL2.md`](docs/SETUP_WIN_WSL2.md)), or Linux / a VPS (see [`docs/SETUP_SERVER.md`](docs/SETUP_SERVER.md))**, with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and an Anthropic Pro / Max subscription.
+- iPhone on iOS 18+.
+- Tailscale / ZeroTier / or just have the iPhone and the computer on the same LAN.
+- Native APNs push (lock-screen / fully-backgrounded delivery) requires an Apple Developer account ($99/yr). Without one, everything else still works: chat / terminal / slash commands are unaffected, and local notifications cover you while the app is open; you just won't get remote push when the app is killed or the phone stays locked (the Bark integration on the Roadmap is for exactly that case).
+- **Xcode 16.3 or newer** (Swift tools 6.1+) if you build the iOS app yourself. GRDB 7.10.0 requires Swift tools 6.1; older Xcode (≤ 16.2) may fail to resolve. TestFlight installs are not affected.
 
 ## Quick start
 
-If you have an AI assistant (Claude.ai / ChatGPT / Cursor / Gemini) handy, the fastest path is:
+Fastest path: copy the full text of [`docs/AI_GUIDED_SETUP_MAC.md`](docs/AI_GUIDED_SETUP_MAC.md), paste it into your favorite AI assistant (Claude.ai / ChatGPT / Cursor / Gemini all work), and prepend one line:
 
 ```
-请按下面这份 spec 一步一步引导我从零安装 ccc。
-
-<paste docs/AI_GUIDED_SETUP_MAC.md content here>
+Please guide me step by step through installing ccc from scratch, following this spec.
 ```
 
-The AI will then walk you through Phase A (prerequisites) → Phase I (common pitfalls), one step at a time.
+The AI plays setup guide from Phase A to Phase I — one step at a time, no question-dumping, no rushing.
 
-If you'd rather follow the docs yourself:
+Prefer reading it yourself:
 
-- **macOS** → [`docs/AI_GUIDED_SETUP_MAC.md`](docs/AI_GUIDED_SETUP_MAC.md) (also doubles as a human-readable manual)
+- **macOS** → [`docs/AI_GUIDED_SETUP_MAC.md`](docs/AI_GUIDED_SETUP_MAC.md) (written to be human-readable too)
 - **Windows (WSL2)** → [`docs/SETUP_WIN_WSL2.md`](docs/SETUP_WIN_WSL2.md)
-- **Server-side details** → [`docs/SETUP_SERVER.md`](docs/SETUP_SERVER.md)
+- **Server details** → [`docs/SETUP_SERVER.md`](docs/SETUP_SERVER.md)
 
-iOS TestFlight access is invite-only right now. Email [opia@starryfield.space](mailto:opia@starryfield.space) or message me on WeChat (ID: CyberSealNull) and I'll add you to the internal group.
+The iOS app is currently TestFlight invite-only. Email [opia@starryfield.space](mailto:opia@starryfield.space) or add WeChat CyberSealNull to get invited.
 
 ## Architecture
 
@@ -68,123 +98,135 @@ iOS TestFlight access is invite-only right now. Email [opia@starryfield.space](m
               │  iPhone running ccc app  │
               └─────────────┬────────────┘
                             │  HTTPS poll + APNs push
-                            │  (or Bark fallback)
+                            │  (no APNs creds: polling + local notifications)
               ┌─────────────▼────────────┐
-              │  Mac running apns-server │
-              │  (Python HTTP server)    │
+              │  Mac/WSL2: apns-server   │
+              │  (Python HTTP service)   │
               └─────────────┬────────────┘
                             │  tmux send-keys / capture-pane
               ┌─────────────▼────────────┐
-              │  tmux session "cc"       │
+              │  tmux session "opia"     │
               │  └ claude (CLI agent)    │
               └──────────────────────────┘
 ```
 
-Network: app and server communicate over Tailscale, ZeroTier, or LAN. The default `config.toml` binds the server to `127.0.0.1`; you bump it to `0.0.0.0` once you've configured the overlay network and the auth secret.
+Networking: the app and server talk over Tailscale / ZeroTier / LAN. The default `config.toml` binds `127.0.0.1`; switch to `0.0.0.0` only after your overlay network + auth secret are in place.
 
-## Experimental Feature Flags
+## Experimental feature flags
 
-New CcCompanion features that change navigation, notifications, rendering, or agent workflows should start behind a Settings toggle backed by `@AppStorage`. The default should be off unless the feature is a compatibility or safety fix. This keeps upgrades stable for existing users while allowing local testers to opt in.
+Any new CcCompanion feature that touches navigation / notifications / rendering / agent workflows should ship behind an `@AppStorage` toggle in Settings, off by default — unless it's a compatibility or security fix. Existing users stay undisturbed; local users who want it flip it on.
 
-Current flag:
+Current flags:
 
-- `feature_group_view`: shows the 工作群 tab and polls `/group/poll` for multi-agent workgroup messages.
+- `feature_group_view`: shows the group tab, polling `/group/poll` for multi-agent collaboration messages.
 
-## Repository layout
+## Repo layout
 
 ```
 CcCompanion/
-├── README.md                    ← Chinese (primary)
+├── README.md                    ← Chinese version
 ├── README.en.md                 ← you are here
 ├── LICENSE                      ← MIT
 ├── DISCLAIMER.md                ← Anthropic trademark disclaimer
-├── .gitignore                   ← what we keep out of git (secrets / logs / build / user data)
+├── .gitignore                   ← what never enters git (secrets / logs / build / user data)
 ├── ios-app/                     ← SwiftUI iOS app (Xcode project)
-│   └── CcCompanion/           ← root Xcode workspace; build scheme `CcCompanion`
-├── apns-server/                 ← Python HTTP server (push.py is the entry point)
+│   └── CcCompanion/           ← Xcode workspace root; build scheme `CcCompanion`
+├── apns-server/                 ← Python HTTP service (push.py is the entry)
 │   ├── push.py                  ← main server
 │   ├── apns_client.py           ← Apple Push wrapper
 │   ├── chat_history.py          ← chat persistence
-│   ├── config.example.toml      ← config template — copy to config.toml and fill
-│   └── …                        ← see "Server modules" below
-├── docs/                        ← setup guides + Apple Developer p8 checklist + WSL2 walkthrough
-└── cccompanion-docs/            ← legacy docs (README, DISCLAIMER, etc.) kept for reference
+│   ├── config.example.toml      ← config template, copy to config.toml and fill in
+│   └── …                        ← other modules, see "Server modules"
+├── docs/                        ← setup guides + Apple Developer p8 checklist + WSL2 flow
+└── cccompanion-docs/            ← historical docs (legacy README / DISCLAIMER etc.) kept for reference
 ```
 
 ### Server modules
 
-The server is organized into self-contained `.py` modules. The headline ones:
+The server is split into standalone `.py` modules. The main ones:
 
-| Module             | What it does                                           |
-| ------------------ | ------------------------------------------------------ |
-| `push.py`          | HTTP server entry point, route handlers, APNs glue.   |
-| `apns_client.py`   | Apple Push HTTP/2 client with JWT auth.               |
-| `chat_history.py`  | Append-only message log + search index.               |
-| `token_store.py`   | Shared-secret store for write-endpoint auth.          |
-| `device_token_store.py` | Persisted iPhone device tokens for APNs.        |
-| `jwt_helper.py`    | APNs `.p8` → JWT signer.                              |
-| `task_queue.py`    | Background work pool.                                 |
-| `usage.py`         | Anthropic usage probe (optional).                      |
+| Module             | What it does                                     |
+| ------------------ | ------------------------------------------------ |
+| `push.py`          | HTTP server entry, route handlers, APNs dispatch. |
+| `apns_client.py`   | Apple Push HTTP/2 client with JWT auth.           |
+| `chat_history.py`  | Append-only message log + search index.           |
+| `token_store.py`   | Shared-secret storage for write-endpoint auth.    |
+| `device_token_store.py` | iPhone APNs device token persistence.        |
+| `jwt_helper.py`    | `.p8`-to-JWT signer.                              |
+| `task_queue.py`    | Background task pool.                             |
+| `usage.py`         | Anthropic usage probe (optional).                 |
 
-Other modules (`diary`, `favorites`, `group_chat`, `rp_history`, `studyroom`, `timeline`, `todos`, `worklog`, `reminders`, `calendar_store`, `pet_state`, `tts`, `settings`, `diary_stream`, `studyroom_indexer`) implement extra endpoints the CcCompanion iOS app does not call. They're kept in-tree because removing them would fragment the import graph in `push.py`. If you build your own iOS client against this server, those endpoints are available but undocumented; treat them as experimental.
+The other modules (`diary`, `favorites`, `group_chat`, `rp_history`, `studyroom`, `timeline`, `todos`, `worklog`, `reminders`, `calendar_store`, `pet_state`, `tts`, `settings`, `diary_stream`, `studyroom_indexer`) are endpoints for a private client; the CcCompanion iOS app doesn't call them. They stay in the repo because `push.py` imports them and removing them would break the import graph. You're welcome to build your own client against those endpoints — undocumented, treat as experimental.
 
 ## Build the iOS app yourself
 
-If you don't want to wait on TestFlight you can build the app directly from source:
+Don't want to wait for TestFlight? Build from source:
 
 ```bash
 cd ios-app/CcCompanion
 open CcCompanion.xcodeproj
-# In Xcode: select scheme "CcCompanion", configuration "CcRelease",
-#          choose your provisioning team, choose your iPhone, ⌘R.
+# In Xcode: pick scheme "CcCompanion", configuration "CcRelease",
+#           choose your signing team, plug in your iPhone, hit ⌘R.
 ```
 
-You will need to:
+You'll need to:
 
-- Set your own bundle identifier in the `CcCompanion` target settings (default is `com.example.cccompanion` and will conflict with anything signed by Apple).
-- Provide your own Apple Developer team for signing (free personal team works for 7-day on-device builds).
-- Enable Push Notifications for that bundle identifier if you want native APNs. The server config bundle id must match exactly, including lowercase `com.starryfield.cccompanion` style casing.
-- Run `apns-server` on a Mac that's reachable from your iPhone, with `config.toml` filled in.
+- Change the bundle id (the default `com.example.cccompanion` conflicts with any Apple-signed app; it won't install unchanged).
+- Provide your own Apple Developer team signing (a free personal team can install 7-day dev builds).
+- For native APNs, enable Push Notifications for that bundle id at developer.apple.com. The bundle id in the server config must match it exactly, including case. **Note**: APNs credentials must belong to whoever signed the app — only the signer's `.p8` can push to its device tokens. TestFlight builds are signed by us, so your own `.p8` won't work against them; only self-signed builds can use your own APNs. Checklist: [`docs/01_apple_developer_p8_checklist.md`](docs/01_apple_developer_p8_checklist.md).
+- Run `apns-server` on a computer reachable from your iPhone (macOS / WSL2 / Linux·VPS), with `config.toml` filled in.
 
-## Common questions
+## FAQ
 
-**Q: Does my data leave my Mac?**
-A: Chat messages and history live on your Mac. When the server pushes a notification, the title / body are sent through Apple's APNs (or Bark's public relay if you chose that). The chat **content** stays on your machine; only the notification preview transits Apple / Bark.
+**Q: Does my data leave my computer?**
+A: Chat content and history stay on your own machine. When the server pushes a notification, the title/body pass through Apple APNs. Chat **content** never leaves the machine; only notification previews pass through Apple.
 
-**Q: Can I run this with no Apple Developer account?**
-A: Yes. Skip the `[apns]` section of `config.toml` and use [Bark](https://github.com/Finb/Bark) as the push channel. Bark is free, open-source, and runs through its author's relay (or your own self-hosted Bark instance).
+**Q: Can I run this without an Apple Developer account?**
+A: Yes — chat / terminal / slash commands are fully functional. Just leave the `[apns]` section of `config.toml` empty. The only difference is notifications: with the app open you get polling + local iOS notifications; you won't get remote push when the app is killed or the phone stays locked. The Bark integration for exactly this case is on the [Roadmap](#roadmap-in-development-not-shipped-yet) — until it lands, don't go looking for a bark config section per older docs; it doesn't exist yet.
+
+**Q: I'm a TestFlight user — can I configure my own APNs push?**
+A: No, and it's Apple's mechanism, not a configuration problem — TestFlight builds are signed by our developer account, so a `.p8` you request yourself can't push to their device tokens (you'd get `DeviceTokenNotForTopic`). TestFlight users: use polling + local notifications, or wait for the Bark integration. For full self-hosted APNs, take the "Build the iOS app yourself" path.
+
+**Q: Can I run the server on Linux / a VPS instead of a Mac?**
+A: Yes. Run `apns-server/push.py` under systemd, keep `claude` in a `tmux` session whose name matches `default_session` in `config.toml`, and expose it over HTTPS — an nginx reverse proxy, or [cloudflared](docs/SETUP_CLOUDFLARED.md) / Tailscale. Keep `strict_auth = true` with a shared secret. See [`docs/SETUP_SERVER.md`](docs/SETUP_SERVER.md) for the Linux/VPS walkthrough.
+
+**Q: The connection dot is red but `curl /health` returns 200 — is the server down?**
+A: No. That dot reflects recent chat-poll freshness and Claude activity, not raw `/health` reachability. On cellular, or behind an idle nginx timeout, a single poll can briefly miss. The current build keeps the dot green whenever the active endpoint's `/health` is reachable, shows "thinking" while Claude is replying, and **never blocks sending** either way.
+
+**Q: Duplicate short replies (e.g. two "Got it.") get dropped — how do I fix it?**
+A: Update `apns-server/claude_hooks/ccc_stop_hook.sh`. The current hook sends a unique `client_msg_id` per turn, so the server dedupes on that id instead of on message content — identical short replies are no longer collapsed. (The content-fallback dedupe window was also narrowed to a few seconds.)
 
 **Q: Is it safe to expose port 8795 to the internet?**
-A: Don't. Run it behind Tailscale / ZeroTier / a reverse proxy with HTTPS + an auth secret. The default `config.toml` ships with `host = "127.0.0.1"` for a reason.
+A: Don't. Put it behind Tailscale / ZeroTier / a reverse proxy with HTTPS, plus the auth secret. The default `config.toml` binds `host = "127.0.0.1"` for a reason.
 
 **Q: Why is the Xcode project under `ios-app/CcCompanion/`?**
-A: It is the public Xcode project for CcCompanion. The scheme, project folder, and bundle id are now aligned around the public name.
+A: That's the public Xcode project for CcCompanion. Scheme, project directory, and bundle id are unified under the public name.
 
 **Q: How do I update?**
-A: `git pull`, then re-build the iOS app and (on the Mac side) restart the `apns-server` LaunchAgent: `launchctl unload ~/Library/LaunchAgents/com.user.apns-server.plist && launchctl load ~/Library/LaunchAgents/com.user.apns-server.plist`.
+A: `git pull`, rebuild the iOS app, and restart the server (on macOS it's a LaunchAgent, command below; on WSL2 restart however you set up auto-start): `launchctl unload ~/Library/LaunchAgents/com.user.apns-server.plist && launchctl load ~/Library/LaunchAgents/com.user.apns-server.plist`.
 
 ## Contributing
 
-Issues and PRs welcome. Some areas where we'd love help:
+Issues and PRs welcome. Things we'd especially love:
 
-- Android client (matches the iOS endpoints, would be a straight port of the chat / terminal flow).
-- Reverse-proxy + HTTPS setup recipes (Caddy, Nginx, Traefik).
-- More language docs (this README is bilingual-but-English-leaning).
-- Cleanup of legacy modules in `apns-server/` that CcCompanion doesn't use.
+- An Android client (matching the iOS endpoints, porting the chat + terminal flows).
+- Reverse proxy + HTTPS recipes (Caddy / Nginx / Traefik).
+- Docs in more languages (this README is bilingual, but the other docs lean English).
+- Cleanup of the legacy server modules CcCompanion doesn't use.
 
-Before opening a PR, please:
+Before opening a PR:
 
-1. Run `xcodebuild -project ios-app/CcCompanion/CcCompanion.xcodeproj -scheme CcCompanion -configuration CcRelease -destination 'generic/platform=iOS' build` — must succeed.
-2. Run `python3 -m py_compile apns-server/*.py` — must produce no errors.
-3. Keep secrets / `.p8` / `config.toml` / `tokens/` / `*.jsonl` out of commits (`.gitignore` already covers these).
+1. `xcodebuild -project ios-app/CcCompanion/CcCompanion.xcodeproj -scheme CcCompanion -configuration CcRelease -destination 'generic/platform=iOS' build` must SUCCEED.
+2. `python3 -m py_compile apns-server/*.py` must pass.
+3. No secrets / `.p8` / `config.toml` / `tokens/` / `*.jsonl` in commits (`.gitignore` already blocks them).
 
 ## License
 
 [MIT](LICENSE). Do whatever you want with it. If it eats your homework, that's on you, not us.
 
-## Acknowledgements
+## Credits
 
-- [Anthropic](https://www.anthropic.com) for Claude and Claude Code.
-- [Apple](https://www.apple.com) for APNs and TestFlight.
-- [Bark](https://github.com/Finb/Bark) for being a brilliant zero-config push fallback.
-- Everyone who tested early TestFlight builds and filed bug reports.
+- [Anthropic](https://www.anthropic.com) — Claude and Claude Code.
+- [Apple](https://www.apple.com) — APNs and TestFlight.
+- [Bark](https://github.com/Finb/Bark) — an excellent open-source push solution; our integration is on the way.
+- Everyone who tested early TestFlight builds, filed bugs, hit the Bark pothole in the old docs, and came back anyway.
