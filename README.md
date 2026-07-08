@@ -74,7 +74,7 @@ CcCompanion 两块:
 
 ## 快速开始
 
-最快路径: 在 macOS 终端或 Windows 的 WSL2 Ubuntu 终端粘这一行:
+最快路径: 在 macOS 终端粘这一行。Windows / WSL2 也走同一条命令, 但当前标为 beta, 等 Windows 真机验证后再摘:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CyberSealNull/CcCompanion/main/install.sh | bash
@@ -97,7 +97,7 @@ AI 会扮演引导员从 Phase A 走到 Phase I, 一步一步带你, 不堆问�
 不想走 AI 引导也可以自己读:
 
 - **macOS** → [`docs/AI_GUIDED_SETUP_MAC.md`](docs/AI_GUIDED_SETUP_MAC.md) (也能给人类直接读, 双用)
-- **Windows (WSL2)** → [`docs/SETUP_WIN_WSL2.md`](docs/SETUP_WIN_WSL2.md)
+- **Windows (WSL2, beta, 待真机验证)** → [`docs/SETUP_WIN_WSL2.md`](docs/SETUP_WIN_WSL2.md)
 - **服务端细节** → [`docs/SETUP_SERVER.md`](docs/SETUP_SERVER.md)
 
 iOS 端 TestFlight 当前定向邀请。邮件 [opia@starryfield.space](mailto:opia@starryfield.space) 或加微信 CyberSealNull 联系我加你测试组。

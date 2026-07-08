@@ -444,6 +444,9 @@ EOF
 
 append_profile_fallback() {
   local profile="$HOME/.profile"
+  local server_dir="$INSTALL_DIR/apns-server"
+  local command_text
+  command_text="$(tmux_command)"
   mkdir -p "$(dirname "$profile")"
   if [[ -f "$profile" ]] && grep -Fq "$PROFILE_MARKER_BEGIN" "$profile"; then
     return
@@ -451,8 +454,19 @@ append_profile_fallback() {
   cat >> "$profile" <<EOF
 
 $PROFILE_MARKER_BEGIN
-if command -v systemctl >/dev/null 2>&1; then
+if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
   systemctl --user start $SERVER_UNIT $TMUX_UNIT >/dev/null 2>&1 || true
+else
+  if command -v tmux >/dev/null 2>&1 && ! tmux has-session -t $SESSION_NAME >/dev/null 2>&1; then
+    tmux new-session -d -s $SESSION_NAME "$command_text" || true
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    if ! pgrep -f "$server_dir/push.py --config $server_dir/config.toml" >/dev/null 2>&1; then
+      nohup "$server_dir/.venv/bin/python3" "$server_dir/push.py" --config "$server_dir/config.toml" >> "$server_dir/server.log" 2>> "$server_dir/server.err.log" &
+    fi
+  else
+    nohup "$server_dir/.venv/bin/python3" "$server_dir/push.py" --config "$server_dir/config.toml" >> "$server_dir/server.log" 2>> "$server_dir/server.err.log" &
+  fi
 fi
 $PROFILE_MARKER_END
 EOF
@@ -578,6 +592,20 @@ PY
 
 uninstall_service() {
   local platform="$1"
+  local config="$INSTALL_DIR/apns-server/config.toml"
+  if [[ -f "$config" ]]; then
+    SESSION_NAME="$(python3 - "$config" "$SESSION_NAME" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text()
+fallback = sys.argv[2]
+match = re.search(r'^default_session = "([^"]+)"', text, re.M)
+print(match.group(1) if match else fallback)
+PY
+)"
+  fi
   info "Removing auto-start service; preserving $INSTALL_DIR and data"
   case "$platform" in
     macos)
@@ -606,7 +634,16 @@ PY
       fi
       ;;
   esac
-  echo "Uninstalled auto-start. Conversation history, config, tokens, and repo files are still in $INSTALL_DIR."
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$SESSION_NAME" >/dev/null 2>&1; then
+    if [[ "$YES" -eq 0 ]] && confirm_tty "Stop tmux session $SESSION_NAME now? This may interrupt running work. (y/N)" "N"; then
+      tmux kill-session -t "$SESSION_NAME" || true
+      echo "Stopped tmux session $SESSION_NAME."
+    else
+      echo "tmux session $SESSION_NAME was left running."
+      echo "To stop it manually: tmux kill-session -t $SESSION_NAME"
+    fi
+  fi
+  echo "Uninstalled auto-start. Preserved install directory, config, tokens, and conversation history in $INSTALL_DIR."
 }
 
 main() {

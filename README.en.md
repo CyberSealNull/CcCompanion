@@ -74,7 +74,7 @@ When these ship we'll update the README and the TestFlight release notes. Until 
 
 ## Quick start
 
-Fastest path: paste this into macOS Terminal or a Windows WSL2 Ubuntu terminal:
+Fastest path: paste this into macOS Terminal. Windows / WSL2 uses the same command, but is currently beta until a real Windows-machine smoke test is complete:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CyberSealNull/CcCompanion/main/install.sh | bash
@@ -97,7 +97,7 @@ The AI plays setup guide from Phase A to Phase I — one step at a time, no ques
 Prefer reading it yourself:
 
 - **macOS** → [`docs/AI_GUIDED_SETUP_MAC.md`](docs/AI_GUIDED_SETUP_MAC.md) (written to be human-readable too)
-- **Windows (WSL2)** → [`docs/SETUP_WIN_WSL2.md`](docs/SETUP_WIN_WSL2.md)
+- **Windows (WSL2, beta, pending real-machine validation)** → [`docs/SETUP_WIN_WSL2.md`](docs/SETUP_WIN_WSL2.md)
 - **Server details** → [`docs/SETUP_SERVER.md`](docs/SETUP_SERVER.md)
 
 The iOS app is currently TestFlight invite-only. Email [opia@starryfield.space](mailto:opia@starryfield.space) or add WeChat CyberSealNull to get invited.
