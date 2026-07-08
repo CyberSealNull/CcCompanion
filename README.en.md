@@ -60,7 +60,6 @@ The items below are being worked on and are **not in the current version**. They
 - **Multi-session** — multiple chat windows in a session list, each connected to its own backend.
 - **Direct API sessions** — the app talks to a model directly with your own API key, no computer in the loop (configurable base URL, proxy-friendly). Keys live only in the iOS Keychain, transcripts stay on the phone — it keeps working when your computer is off or offline. The escape hatch of the whole system.
 - **In-app effort switching** — no more typing commands in the terminal for this.
-- **One-shot installer** — paste the same single command on macOS or Windows (WSL2); it clones the repo, installs dependencies, generates config, sets up auto-start, runs a health check, and prints the URL + secret your iPhone needs — plus a `ccc-update` command for one-line upgrades. Once it ships, Quick start below will lead with it.
 - **Bark push integration** — lock-screen push for users without an Apple Developer account ([Bark](https://github.com/Finb/Bark) is free and open source). **Erratum**: earlier versions of this README described Bark fallback as an existing feature; the server-side integration had not actually landed. The docs got ahead of the code — this revision corrects that, with apologies to anyone who went looking for the bark config section. Until it lands, use "polling local notifications" above.
 
 When these ship we'll update the README and the TestFlight release notes. Until then, this section is the source of truth.
@@ -75,7 +74,19 @@ When these ship we'll update the README and the TestFlight release notes. Until 
 
 ## Quick start
 
-Fastest path: copy the full text of [`docs/AI_GUIDED_SETUP_MAC.md`](docs/AI_GUIDED_SETUP_MAC.md), paste it into your favorite AI assistant (Claude.ai / ChatGPT / Cursor / Gemini all work), and prepend one line:
+Fastest path: paste this into macOS Terminal or a Windows WSL2 Ubuntu terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CyberSealNull/CcCompanion/main/install.sh | bash
+```
+
+The installer checks prerequisites, clones the repo, creates the Python venv, generates `config.toml`, starts `claude` in `tmux`, sets up auto-start, runs `/health`, and prints the Server URL + Secret for iPhone onboarding. Later updates are:
+
+```bash
+ccc-update
+```
+
+If you want to understand each step, or you get stuck and want an AI assistant to guide you, copy the full text of [`docs/AI_GUIDED_SETUP_MAC.md`](docs/AI_GUIDED_SETUP_MAC.md), paste it into your favorite AI assistant (Claude.ai / ChatGPT / Cursor / Gemini all work), and prepend one line:
 
 ```
 Please guide me step by step through installing ccc from scratch, following this spec.
@@ -105,12 +116,12 @@ The iOS app is currently TestFlight invite-only. Email [opia@starryfield.space](
               └─────────────┬────────────┘
                             │  tmux send-keys / capture-pane
               ┌─────────────▼────────────┐
-              │  tmux session "opia"     │
+              │  tmux session "cc"       │
               │  └ claude (CLI agent)    │
               └──────────────────────────┘
 ```
 
-Networking: the app and server talk over Tailscale / ZeroTier / LAN. The default `config.toml` binds `127.0.0.1`; switch to `0.0.0.0` only after your overlay network + auth secret are in place.
+Networking: the app and server talk over Tailscale / ZeroTier / LAN. The one-shot installer writes `strict_auth = true`, a strong random `shared_secret`, and binds the server to `0.0.0.0` so the phone can reach it. If you install manually, `config.example.toml` defaults to `127.0.0.1`; switch to `0.0.0.0` only after your overlay network + auth secret are in place.
 
 ## Experimental feature flags
 

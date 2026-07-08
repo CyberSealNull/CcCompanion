@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LABEL="com.cccompanion.apns-server"
+SERVER_UNIT="ccc-apns-server.service"
+TMUX_UNIT="ccc-tmux.service"
+INSTALL_DIR=""
+SKIP_SERVICE=0
+
+usage() {
+  cat <<'EOF'
+CcCompanion updater
+
+Usage:
+  ccc-update [options]
+
+Options:
+  --dir PATH       Installed CcCompanion checkout (auto-detected when possible)
+  --skip-service   Update files and dependencies without restarting services
+  -h, --help       Show this help
+EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+info() {
+  printf '==> %s\n' "$*"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir) INSTALL_DIR="$2"; shift 2 ;;
+      --skip-service) SKIP_SERVICE=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+}
+
+resolve_script_path() {
+  local source="${BASH_SOURCE[0]:-$0}"
+  while [[ -L "$source" ]]; do
+    local dir target
+    dir="$(cd "$(dirname "$source")" && pwd -P)"
+    target="$(readlink "$source")"
+    case "$target" in
+      /*) source="$target" ;;
+      *) source="$dir/$target" ;;
+    esac
+  done
+  case "$source" in
+    /*) printf '%s' "$source" ;;
+    *) printf '%s/%s' "$PWD" "$source" ;;
+  esac
+}
+
+detect_install_dir() {
+  if [[ -n "$INSTALL_DIR" ]]; then
+    INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
+    return
+  fi
+  local script dir parent
+  script="$(resolve_script_path)"
+  dir="$(cd "$(dirname "$script")" && pwd -P)"
+  if [[ "$(basename "$dir")" == "bin" ]]; then
+    parent="$(cd "$dir/.." && pwd -P)"
+    if [[ -d "$parent/apns-server" ]]; then
+      INSTALL_DIR="$parent"
+      return
+    fi
+  fi
+  if [[ -d "$dir/apns-server" ]]; then
+    INSTALL_DIR="$dir"
+    return
+  fi
+  die "could not auto-detect install dir; pass --dir PATH"
+}
+
+detect_platform() {
+  if [[ -n "${CCC_PLATFORM_OVERRIDE:-}" ]]; then
+    printf '%s' "$CCC_PLATFORM_OVERRIDE"
+    return
+  fi
+  local kernel
+  kernel="$(uname -s)"
+  if [[ "$kernel" == "Darwin" ]]; then
+    printf 'macos'
+  elif [[ "$kernel" == "Linux" ]]; then
+    if [[ -r /proc/version ]] && grep -qi microsoft /proc/version; then
+      printf 'wsl2'
+    else
+      printf 'linux'
+    fi
+  else
+    printf 'linux-unknown'
+  fi
+}
+
+update_git() {
+  cd "$INSTALL_DIR"
+  local old new
+  old="$(git rev-parse --short HEAD 2>/dev/null || true)"
+  info "Updating git checkout at $INSTALL_DIR"
+  if git pull --ff-only; then
+    :
+  else
+    echo "WARN: git pull --ff-only failed; leaving checkout as-is. Resolve manually if this branch diverged." >&2
+  fi
+  new="$(git rev-parse --short HEAD 2>/dev/null || true)"
+  echo "Git: ${old:-unknown} -> ${new:-unknown}"
+}
+
+update_deps() {
+  local server_dir="$INSTALL_DIR/apns-server"
+  [[ -d "$server_dir" ]] || die "missing apns-server in $INSTALL_DIR"
+  if [[ ! -d "$server_dir/.venv" ]]; then
+    info "Creating Python venv"
+    python3 -m venv "$server_dir/.venv"
+  fi
+  if [[ "${CCC_INSTALLER_SKIP_PIP:-0}" != "1" ]]; then
+    info "Updating Python dependencies"
+    "$server_dir/.venv/bin/python3" -m pip install --upgrade pip
+    "$server_dir/.venv/bin/pip" install -r "$server_dir/requirements.txt"
+  else
+    info "Skipping pip install because CCC_INSTALLER_SKIP_PIP=1"
+  fi
+  echo "config.toml is preserved: $server_dir/config.toml is not managed by git."
+}
+
+restart_services() {
+  [[ "$SKIP_SERVICE" -eq 1 ]] && { info "Skipping service restart"; return; }
+  local platform="$1"
+  case "$platform" in
+    macos)
+      if command -v launchctl >/dev/null 2>&1; then
+        launchctl kickstart -k "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || \
+          launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$LABEL.plist" >/dev/null 2>&1 || true
+      fi
+      ;;
+    wsl2|linux|linux-unknown)
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user daemon-reload || true
+        systemctl --user restart "$SERVER_UNIT" "$TMUX_UNIT" || true
+      fi
+      ;;
+  esac
+}
+
+print_recent_changes() {
+  echo
+  echo "Recent changes"
+  echo "--------------"
+  if [[ -f "$INSTALL_DIR/CHANGELOG.json" ]]; then
+    python3 - "$INSTALL_DIR/CHANGELOG.json" <<'PY' || true
+import json
+import pathlib
+import sys
+
+data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+keys = sorted(data, key=lambda k: int(k) if str(k).isdigit() else -1)
+if not keys:
+    raise SystemExit
+key = keys[-1]
+entry = data[key]
+print(f"{key}: {entry.get('title', 'Update')}")
+for item in entry.get("items", [])[:5]:
+    print(f"- {item}")
+PY
+  else
+    git -C "$INSTALL_DIR" log --oneline -5 || true
+  fi
+}
+
+main() {
+  parse_args "$@"
+  detect_install_dir
+  [[ -d "$INSTALL_DIR/.git" ]] || die "$INSTALL_DIR is not a git checkout"
+  update_git
+  update_deps
+  restart_services "$(detect_platform)"
+  print_recent_changes
+  echo
+  echo "Update complete. If the iPhone app is open, retry its connection test."
+}
+
+main "$@"

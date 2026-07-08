@@ -60,7 +60,6 @@ CcCompanion 两块:
 - **多会话** — 会话列表里开多个聊天窗口, 每个会话各自连自己的后端。
 - **Direct API 直连会话** — 不经过电脑, app 直接拿你自己的 API key 连模型 (base URL 可配, 兼容中转)。key 只存 iOS Keychain, 聊天记录存手机本地 — 电脑关机、断网时它照样能用, 是整套系统的"逃生口"。
 - **app 内手动切换 effort** — 不用再去终端敲命令。
-- **一键安装整合包** — macOS 跟 Windows (WSL2) 粘同一行命令, 自动完成拉代码、装依赖、生成配置、开机自启、健康自检, 最后把手机端要填的地址密码直接打在屏幕上; 附 `ccc-update` 一键升级命令。落地后本 README 的快速开始会改成一行命令优先。
 - **Bark 推送集成** — 给没有 Apple Developer 账号的用户做的锁屏推送方案 ([Bark](https://github.com/Finb/Bark) 免费开源)。**勘误**: 此前这份 README 把 Bark 兜底描述成了现成功能, 实际 server 端集成尚未落地, 是文档跑到了代码前面, 这一版更正并向按旧文档配置踩空的朋友道歉。落地前, 没有 Developer 账号的用户请用上面的"轮询本地通知"。
 
 以上发布时会更新 README 和 TestFlight 版本说明, 发布前请以本节为准。
@@ -75,7 +74,19 @@ CcCompanion 两块:
 
 ## 快速开始
 
-最快路径: 复制 [`docs/AI_GUIDED_SETUP_MAC.md`](docs/AI_GUIDED_SETUP_MAC.md) 全文, 粘到你常用的 AI 助手 (Claude.ai / ChatGPT / Cursor / Gemini 都行), 在最前面加一句:
+最快路径: 在 macOS 终端或 Windows 的 WSL2 Ubuntu 终端粘这一行:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CyberSealNull/CcCompanion/main/install.sh | bash
+```
+
+脚本会检查依赖, clone 仓库, 建 venv, 生成 `config.toml`, 起 `tmux` 里的 `claude`, 设置开机自启, 跑 `/health` 自检, 最后把 iPhone onboarding 要填的 Server URL 和 Secret 打在屏幕上。以后更新跑:
+
+```bash
+ccc-update
+```
+
+想理解每一步, 或者安装时卡住要人工排查, 再读 AI 引导文档: 复制 [`docs/AI_GUIDED_SETUP_MAC.md`](docs/AI_GUIDED_SETUP_MAC.md) 全文, 粘到你常用的 AI 助手 (Claude.ai / ChatGPT / Cursor / Gemini 都行), 在最前面加一句:
 
 ```
 请按下面这份 spec 一步一步引导我从零安装 ccc。
@@ -105,12 +116,12 @@ iOS 端 TestFlight 当前定向邀请。邮件 [opia@starryfield.space](mailto:o
               └─────────────┬────────────┘
                             │  tmux send-keys / capture-pane
               ┌─────────────▼────────────┐
-              │  tmux 里 session "opia"  │
+              │  tmux 里 session "cc"    │
               │  └ claude (CLI agent)    │
               └──────────────────────────┘
 ```
 
-网络: app 跟 server 走 Tailscale / ZeroTier / LAN 通讯。默认 `config.toml` 绑 `127.0.0.1`, 你配好 overlay 网络 + auth secret 后再改 `0.0.0.0`。
+网络: app 跟 server 走 Tailscale / ZeroTier / LAN 通讯。一键安装脚本会写入 `strict_auth = true`、强随机 `shared_secret`, 并把 server 绑到 `0.0.0.0` 方便手机访问。手动安装时, `config.example.toml` 默认绑 `127.0.0.1`; 只有配好 overlay 网络 + auth secret 后再改 `0.0.0.0`。
 
 ## 实验性 Feature Flag
 
