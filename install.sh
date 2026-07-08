@@ -205,9 +205,9 @@ collect_prompts() {
 clone_or_reuse_repo() {
   if [[ -d "$INSTALL_DIR/.git" ]]; then
     if [[ "$FORCE" -eq 0 ]]; then
-      info "Existing install found at $INSTALL_DIR"
-      echo "Run ccc-update to update it, or rerun install.sh with --force to refresh setup."
-      exit 0
+      info "Existing checkout found at $INSTALL_DIR; resuming setup"
+      echo "Existing config will be preserved. Use ccc-update for normal updates."
+      return
     fi
     info "Reusing existing checkout at $INSTALL_DIR"
     return
@@ -247,22 +247,46 @@ PY
   fi
 }
 
+toml_string_value() {
+  local file="$1"
+  local key="$2"
+  [[ -f "$file" ]] || return 1
+  python3 - "$file" "$key" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+key = re.escape(sys.argv[2])
+match = re.search(rf'^{key} = "([^"]*)"', path.read_text(), re.M)
+if not match:
+    raise SystemExit(1)
+print(match.group(1))
+PY
+}
+
 write_config() {
   local server_dir="$INSTALL_DIR/apns-server"
   local config="$server_dir/config.toml"
   local example="$server_dir/config.example.toml"
-  local secret token_path p8_path team_id key_id bundle_id
+  local secret token_path p8_path team_id key_id bundle_id existing_secret
   [[ -f "$example" ]] || die "missing config.example.toml"
   if [[ -f "$config" && "$FORCE" -eq 0 ]]; then
     info "config.toml already exists; preserving user config"
     return
   fi
-  secret="$(generate_secret)"
+  existing_secret="$(toml_string_value "$config" "shared_secret" 2>/dev/null || true)"
+  if [[ -n "$existing_secret" ]]; then
+    secret="$existing_secret"
+    info "Preserving existing shared_secret"
+  else
+    secret="$(generate_secret)"
+  fi
   token_path="$server_dir/tokens/active.json"
-  p8_path=""
-  team_id=""
-  key_id=""
-  bundle_id=""
+  p8_path="$(toml_string_value "$config" "p8_path" 2>/dev/null || true)"
+  team_id="$(toml_string_value "$config" "team_id" 2>/dev/null || true)"
+  key_id="$(toml_string_value "$config" "key_id" 2>/dev/null || true)"
+  bundle_id="$(toml_string_value "$config" "bundle_id" 2>/dev/null || true)"
   if [[ "$APNS_HAVE" -eq 1 ]]; then
     [[ -f "${APNS_P8/#\~/$HOME}" ]] || die "APNs .p8 file not found: $APNS_P8"
     mkdir -p "$server_dir/secrets"
@@ -276,6 +300,10 @@ write_config() {
     key_id="$APNS_KEY_ID"
     bundle_id="$APNS_BUNDLE_ID"
   fi
+  p8_path="${p8_path:-}"
+  team_id="${team_id:-}"
+  key_id="${key_id:-}"
+  bundle_id="${bundle_id:-}"
   info "Writing apns-server/config.toml"
   python3 - "$example" "$config" "$p8_path" "$team_id" "$key_id" "$bundle_id" "$PORT" "$token_path" "$secret" "$SESSION_NAME" <<'PY'
 import json
@@ -590,6 +618,24 @@ PY
   echo "Update later: $INSTALL_DIR/bin/ccc-update"
 }
 
+safe_rm_file() {
+  local target="$1"
+  local allowed_dir="$2"
+  case "$target" in
+    "$allowed_dir"/*) rm -f -- "$target" ;;
+    *) die "refusing to remove unexpected path: $target" ;;
+  esac
+}
+
+safe_remove_launch_agent() {
+  safe_rm_file "$HOME/Library/LaunchAgents/$LABEL.plist" "$HOME/Library/LaunchAgents"
+}
+
+safe_remove_systemd_unit() {
+  local unit="$1"
+  safe_rm_file "$HOME/.config/systemd/user/$unit" "$HOME/.config/systemd/user"
+}
+
 uninstall_service() {
   local platform="$1"
   local config="$INSTALL_DIR/apns-server/config.toml"
@@ -610,14 +656,15 @@ PY
   case "$platform" in
     macos)
       launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-      rm -f "$HOME/Library/LaunchAgents/$LABEL.plist"
+      safe_remove_launch_agent
       ;;
     wsl2|linux|linux-unknown)
       if command -v systemctl >/dev/null 2>&1; then
         systemctl --user disable --now "$SERVER_UNIT" "$TMUX_UNIT" >/dev/null 2>&1 || true
         systemctl --user daemon-reload >/dev/null 2>&1 || true
       fi
-      rm -f "$HOME/.config/systemd/user/$SERVER_UNIT" "$HOME/.config/systemd/user/$TMUX_UNIT"
+      safe_remove_systemd_unit "$SERVER_UNIT"
+      safe_remove_systemd_unit "$TMUX_UNIT"
       if [[ -f "$HOME/.profile" ]]; then
         python3 - "$HOME/.profile" "$PROFILE_MARKER_BEGIN" "$PROFILE_MARKER_END" <<'PY'
 import pathlib, sys

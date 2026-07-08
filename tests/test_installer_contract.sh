@@ -30,6 +30,23 @@ assert_not_contains() {
   fi
 }
 
+config_value() {
+  local file="$1"
+  local key="$2"
+  python3 - "$file" "$key" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text()
+key = re.escape(sys.argv[2])
+match = re.search(rf'^{key} = "([^"]*)"', text, re.M)
+if not match:
+    raise SystemExit(f"missing key: {sys.argv[2]}")
+print(match.group(1))
+PY
+}
+
 make_fakebin() {
   local dir="$1"
   mkdir -p "$dir"
@@ -256,6 +273,97 @@ run_wsl2_no_systemd_contract() {
   assert_contains "$log" "nohup $install_dir/apns-server/.venv/bin/python3 $install_dir/apns-server/push.py"
 }
 
+run_existing_checkout_rerun_resumes_contract() {
+  local tmp home fakebin install_dir log config
+  tmp="$(mktemp -d)"
+  home="$tmp/home"
+  fakebin="$tmp/fakebin"
+  install_dir="$tmp/CcCompanion"
+  log="$tmp/fake.log"
+  mkdir -p "$home"
+  : > "$log"
+  make_fakebin "$fakebin"
+  git clone "$ROOT" "$install_dir" >/dev/null 2>&1
+
+  PATH="$fakebin:$PATH" \
+  HOME="$home" \
+  CCC_FAKE_LOG="$log" \
+  CCC_PLATFORM_OVERRIDE="macos" \
+  CCC_INSTALLER_SKIP_PIP="1" \
+  bash "$ROOT/install.sh" \
+    --repo-url "$ROOT" \
+    --dir "$install_dir" \
+    --port 18796 \
+    --session resumecc \
+    --yes \
+    --skip-service \
+    --skip-health > "$tmp/rerun.out"
+
+  config="$install_dir/apns-server/config.toml"
+  assert_file "$config"
+  assert_contains "$config" 'default_session = "resumecc"'
+  assert_contains "$tmp/rerun.out" "Existing checkout found"
+}
+
+run_force_preserves_secret_contract() {
+  local tmp home fakebin install_dir log config secret_before secret_after
+  tmp="$(mktemp -d)"
+  home="$tmp/home"
+  fakebin="$tmp/fakebin"
+  install_dir="$tmp/CcCompanion"
+  log="$tmp/fake.log"
+  mkdir -p "$home"
+  : > "$log"
+  make_fakebin "$fakebin"
+
+  PATH="$fakebin:$PATH" \
+  HOME="$home" \
+  CCC_FAKE_LOG="$log" \
+  CCC_PLATFORM_OVERRIDE="macos" \
+  CCC_INSTALLER_SKIP_PIP="1" \
+  bash "$ROOT/install.sh" \
+    --repo-url "$ROOT" \
+    --dir "$install_dir" \
+    --port 18797 \
+    --session force_a \
+    --yes \
+    --skip-service \
+    --skip-health > /dev/null
+
+  config="$install_dir/apns-server/config.toml"
+  secret_before="$(config_value "$config" shared_secret)"
+
+  PATH="$fakebin:$PATH" \
+  HOME="$home" \
+  CCC_FAKE_LOG="$log" \
+  CCC_PLATFORM_OVERRIDE="macos" \
+  CCC_INSTALLER_SKIP_PIP="1" \
+  bash "$ROOT/install.sh" \
+    --repo-url "$ROOT" \
+    --dir "$install_dir" \
+    --port 18798 \
+    --session force_b \
+    --yes \
+    --force \
+    --skip-service \
+    --skip-health > "$tmp/force.out"
+
+  secret_after="$(config_value "$config" shared_secret)"
+  [[ "$secret_before" == "$secret_after" ]] || fail "--force should preserve existing shared_secret"
+  assert_contains "$config" 'default_session = "force_b"'
+  assert_contains "$tmp/force.out" "Preserving existing shared_secret"
+}
+
+run_destructive_path_guard_contract() {
+  assert_contains "$ROOT/install.sh" "safe_rm_file()"
+  assert_contains "$ROOT/install.sh" "safe_remove_launch_agent"
+  assert_contains "$ROOT/install.sh" "safe_remove_systemd_unit"
+  # shellcheck disable=SC2016
+  assert_not_contains "$ROOT/install.sh" 'rm -f "$HOME/Library/LaunchAgents/$LABEL.plist"'
+  # shellcheck disable=SC2016
+  assert_not_contains "$ROOT/install.sh" 'rm -f "$HOME/.config/systemd/user/$SERVER_UNIT" "$HOME/.config/systemd/user/$TMUX_UNIT"'
+}
+
 run_update_preserves_config_contract() {
   local tmp home fakebin install_dir log config before after out
   tmp="$(mktemp -d)"
@@ -300,5 +408,8 @@ run_update_preserves_config_contract() {
 run_macos_install_contract
 run_wsl2_contract
 run_wsl2_no_systemd_contract
+run_existing_checkout_rerun_resumes_contract
+run_force_preserves_secret_contract
+run_destructive_path_guard_contract
 run_update_preserves_config_contract
 echo "installer contract tests passed"
