@@ -317,6 +317,7 @@ struct ChatStoreScope {
         var idx = 0
         let total = messages.count
         while idx < total {
+            guard !Task.isCancelled else { return }
             let end = min(idx + batch, total)
             let chunk = Array(messages[idx..<end])
             try? await queue.write { db in
@@ -326,6 +327,7 @@ struct ChatStoreScope {
                 }
             }
             idx = end
+            guard !Task.isCancelled else { return }
             await Task.yield()
         }
     }

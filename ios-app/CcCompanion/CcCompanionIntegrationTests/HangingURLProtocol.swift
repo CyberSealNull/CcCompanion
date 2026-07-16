@@ -2,21 +2,8 @@
 //  HangingURLProtocol.swift
 //  CcCompanionIntegrationTests
 //
-//  P0 四审前置: 上一轮 code review 點名的硬門 ——「fake transport + 兩庫 fixture: 掛起響應 →
-//  切模式 → 放行」端到端集成測試需要一個真正能"掛起"的假 transport, 不是
-//  DirectAPICoreTests/MockURLProtocol 那種立刻同步回應的版本. startLoading() 收到請求後在 gate
-//  上 await, 測試呼叫 release() 之前永遠不會回調 client —— 由此才能構造"響應還沒回來, 用戶已經
-//  切了模式"這個時序.
-//
-//  不用 DispatchSemaphore.wait() 橋接 async gate: learnings/2026-07-13_自验证工具本身要先用负例
-//  正例炼过再信 記過一次真事故 —— ChatStoreScopeSelfTest 第一版用 Task+semaphore 橋 async API,
-//  在 App.init() 同步上下文直接卡死. 這裡改用 startLoading() 內起一個獨立 Task await actor gate,
-//  不阻塞任何真線程.
-//
-//  经验证(cancel_probe.swift 现场跑过): Task.cancel() 会让 session.data(for:) 提前收到
-//  NSURLErrorCancelled(-999), 不等这个协议真的回调 —— 所以本类只用于"不经 stopAndWait() 追踪"的
-//  裸调用场景(测试直接调 vm.loadEarlier(), 不经 loadEarlierTracked()), 才能真正测到"响应延迟到达,
-//  写去哪个 scope"这个属性, 不被 mode 切换顺带触发的 cancel 提前短路掉.
+//  Deterministic transport for tracked-operation lifecycle tests. Requests pause at
+//  an async gate until release(), while cancellation and reset wake every waiter.
 
 import Foundation
 
@@ -29,39 +16,91 @@ final class HangingURLProtocol: URLProtocol, @unchecked Sendable {
 
     private actor Gate {
         private var isOpen = false
-        private var openWaiters: [CheckedContinuation<Void, Never>] = []
+        private var openWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+        private var cancelledOpenWaiters: Set<UUID> = []
         private var arrivedCount = 0
-        private var arrivalWaiters: [(threshold: Int, cont: CheckedContinuation<Void, Never>)] = []
+        private var arrivalWaiters: [UUID: (threshold: Int, cont: CheckedContinuation<Void, Error>)] = [:]
+        private var cancelledArrivalWaiters: Set<UUID> = []
 
-        func waitUntilOpen() async {
+        func waitUntilOpen() async throws {
             if isOpen { return }
-            await withCheckedContinuation { openWaiters.append($0) }
+            let id = UUID()
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    if isOpen {
+                        continuation.resume()
+                    } else if Task.isCancelled || cancelledOpenWaiters.remove(id) != nil {
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        openWaiters[id] = continuation
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancelOpenWaiter(id) }
+            }
         }
 
         func open() {
             isOpen = true
-            let waiters = openWaiters
-            openWaiters.removeAll()
+            let waiters = Array(openWaiters.values)
+            openWaiters.removeAll(keepingCapacity: false)
             waiters.forEach { $0.resume() }
         }
 
         func recordArrival() {
             arrivedCount += 1
-            let ready = arrivalWaiters.filter { arrivedCount >= $0.threshold }
-            arrivalWaiters.removeAll { arrivedCount >= $0.threshold }
-            ready.forEach { $0.cont.resume() }
+            let readyIds = arrivalWaiters.compactMap { id, waiter in
+                arrivedCount >= waiter.threshold ? id : nil
+            }
+            let ready = readyIds.compactMap { arrivalWaiters.removeValue(forKey: $0)?.cont }
+            ready.forEach { $0.resume() }
         }
 
-        func waitForArrival(atLeast threshold: Int) async {
+        func waitForArrival(atLeast threshold: Int) async throws {
             if arrivedCount >= threshold { return }
-            await withCheckedContinuation { arrivalWaiters.append((threshold, $0)) }
+            let id = UUID()
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    if arrivedCount >= threshold {
+                        continuation.resume()
+                    } else if Task.isCancelled || cancelledArrivalWaiters.remove(id) != nil {
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        arrivalWaiters[id] = (threshold, continuation)
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancelArrivalWaiter(id) }
+            }
         }
 
         func reset() {
             isOpen = false
-            openWaiters.removeAll()
             arrivedCount = 0
-            arrivalWaiters.removeAll()
+            let open = Array(openWaiters.values)
+            let arrivals = arrivalWaiters.values.map(\.cont)
+            openWaiters.removeAll(keepingCapacity: false)
+            arrivalWaiters.removeAll(keepingCapacity: false)
+            cancelledOpenWaiters.removeAll(keepingCapacity: false)
+            cancelledArrivalWaiters.removeAll(keepingCapacity: false)
+            open.forEach { $0.resume(throwing: CancellationError()) }
+            arrivals.forEach { $0.resume(throwing: CancellationError()) }
+        }
+
+        private func cancelOpenWaiter(_ id: UUID) {
+            if let continuation = openWaiters.removeValue(forKey: id) {
+                continuation.resume(throwing: CancellationError())
+            } else {
+                cancelledOpenWaiters.insert(id)
+            }
+        }
+
+        private func cancelArrivalWaiter(_ id: UUID) {
+            if let continuation = arrivalWaiters.removeValue(forKey: id)?.cont {
+                continuation.resume(throwing: CancellationError())
+            } else {
+                cancelledArrivalWaiters.insert(id)
+            }
         }
     }
 
@@ -69,6 +108,8 @@ final class HangingURLProtocol: URLProtocol, @unchecked Sendable {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var _responseProvider: ((URLRequest) -> StubResponse)?
     nonisolated(unsafe) private static var _capturedRequests: [URLRequest] = []
+    private let loadingLock = NSLock()
+    private var loadingTask: Task<Void, Never>?
 
     static var responseProvider: ((URLRequest) -> StubResponse)? {
         get { lock.withLock { _responseProvider } }
@@ -100,11 +141,20 @@ final class HangingURLProtocol: URLProtocol, @unchecked Sendable {
     static func waitForRequestReceived(count: Int = 1, timeout: TimeInterval = 10) async -> Bool {
         await withTaskGroup(of: Bool.self) { group in
             group.addTask {
-                await gate.waitForArrival(atLeast: count)
-                return true
+                do {
+                    try await gate.waitForArrival(atLeast: count)
+                    return true
+                } catch {
+                    return false
+                }
             }
             group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                do {
+                    let nanoseconds = UInt64(max(0, timeout) * 1_000_000_000)
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } catch {
+                    return false
+                }
                 return false
             }
             let result = await group.next() ?? false
@@ -123,9 +173,18 @@ final class HangingURLProtocol: URLProtocol, @unchecked Sendable {
 
     override func startLoading() {
         Self.lock.withLock { Self._capturedRequests.append(request) }
-        Task {
+        let task = Task { [weak self] in
+            guard let self else { return }
             await Self.gate.recordArrival()
-            await Self.gate.waitUntilOpen()
+            do {
+                try await Self.gate.waitUntilOpen()
+                try Task.checkCancellation()
+            } catch {
+                if !Task.isCancelled {
+                    client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
+                }
+                return
+            }
             guard let provider = Self.responseProvider else {
                 client?.urlProtocol(self, didFailWithError: URLError(.unknown))
                 return
@@ -140,9 +199,17 @@ final class HangingURLProtocol: URLProtocol, @unchecked Sendable {
             client?.urlProtocol(self, didLoad: stub.body)
             client?.urlProtocolDidFinishLoading(self)
         }
+        loadingLock.withLock { loadingTask = task }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        let task = loadingLock.withLock {
+            let current = loadingTask
+            loadingTask = nil
+            return current
+        }
+        task?.cancel()
+    }
 
     static func makeSession(timeout: TimeInterval = 30) -> URLSession {
         let config = URLSessionConfiguration.default

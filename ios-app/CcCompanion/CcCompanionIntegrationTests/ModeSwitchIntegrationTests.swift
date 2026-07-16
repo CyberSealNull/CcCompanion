@@ -2,21 +2,8 @@
 //  ModeSwitchIntegrationTests.swift
 //  CcCompanionIntegrationTests
 //
-//  P0 四审前置(2026-07-16): 上一轮 code review(第三輪)點名的硬門 ——
-//  「fake transport + 兩庫 fixture: 掛起響應 → 切模式 → 放行」端到端集成測試, 之前三輪一直
-//  NOT IMPLEMENTED. 這裡補齊.
-//
-//  範圍邊界(讀 spec 前先讀這段, 別誤會這條測試證明了什麼):
-//  - 只測 learnings/2026-07-13_运行时computed路由跨await会串库 那一類 bug(單次延遲切換時,
-//    響應該落哪個 scope) —— 不測 learnings/2026-07-13_单槽Task句柄覆盖不等于任务ownership
-//    那一類(連續快切模式的 task 世代競態). 後者是上一輪 review P0-1 仍未關閉的缺口, 這條 spec
-//    明確只要求前者, 依赖注入范围也只到"最小面", 没有要求修 task ownership. 见 result 文件.
-//  - loadEarlier() 是直接裸調(不經 loadEarlierTracked()), 不進 vm.loadEarlierTask 句柄, 刻意不
-//    讓 stopAndWait() 追蹤到它. 這不是漏掉 Tracked 包裝 —— 現場拿 cancel_probe.swift 驗證過:
-//    Task.cancel() 會讓掛起中的 session.data(for:) 提前收到 NSURLErrorCancelled(-999), 根本不會
-//    等這個假 protocol 真的放行. 如果改走 Tracked 版本, 切模式那一刻 stopAndWait() 就會把這個任務
-//    cancel 掉, 響應永遍沒機會真正落庫 —— 對 fixed 版本測不出通過的意義, 對 buggy 版本也測不出
-//    串庫, 等於測試失去了牙. 直調是刻意的隔離手段, 用來單獨驗證 scope-freezing 這個屬性本身.
+//  End-to-end coverage for backend generation ownership, serialized transitions,
+//  replacement task joining, scoped storage, and stale-result rejection.
 //
 //  環境警告: 這是 TEST_HOST 掛在 CcCompanion.app 裡跑的 unit test, ChatStore.shared 走的是
 //  APP 真實 Application Support 路徑下的 ChatCache.db / ChatCacheDirectAPI.db(跟 App 手動啟動
@@ -25,6 +12,54 @@
 
 import XCTest
 @testable import CcCompanion
+
+private final class DirectStreamHarness: @unchecked Sendable {
+    private let lock = NSLock()
+    private var starts = 0
+    private var continuations: [UUID: AsyncThrowingStream<String, Error>.Continuation] = [:]
+    private var order: [UUID] = []
+
+    var startCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return starts
+    }
+
+    var activeCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return continuations.count
+    }
+
+    func makeStream() -> AsyncThrowingStream<String, Error> {
+        let id = UUID()
+        return AsyncThrowingStream { continuation in
+            lock.lock()
+            starts += 1
+            continuations[id] = continuation
+            order.append(id)
+            lock.unlock()
+            continuation.onTermination = { [weak self] _ in
+                self?.remove(id: id)
+            }
+        }
+    }
+
+    func finishLatest(with text: String) {
+        lock.lock()
+        let continuation = order.last.flatMap { continuations[$0] }
+        lock.unlock()
+        continuation?.yield(text)
+        continuation?.finish()
+    }
+
+    private func remove(id: UUID) {
+        lock.lock()
+        continuations.removeValue(forKey: id)
+        order.removeAll { $0 == id }
+        lock.unlock()
+    }
+}
 
 @MainActor
 final class ModeSwitchIntegrationTests: XCTestCase {
@@ -41,11 +76,17 @@ final class ModeSwitchIntegrationTests: XCTestCase {
         try await super.tearDown()
     }
 
+    func testWaitForRequestReceivedReturnsFalseWhenNoRequestArrives() async {
+        let result = await HangingURLProtocol.waitForRequestReceived(timeout: 0.05)
+
+        XCTAssertFalse(result)
+    }
+
     // MARK: - Fixtures
 
     private func seedAnchorMessage(idSuffix: String) -> ChatMessage {
         ChatMessage(
-            ts: "2000-06-01T00:00:00.000Z",
+            ts: "1900-06-01T00:00:00.000Z",
             role: "user",
             text: "seed-anchor",
             source: nil,
@@ -79,6 +120,16 @@ final class ModeSwitchIntegrationTests: XCTestCase {
         return (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
     }
 
+    private func historyResponseJSON(ts: String, text: String) -> Data {
+        let payload: [String: Any] = [
+            "ok": true,
+            "records": [
+                ["ts": ts, "role": "assistant", "text": text] as [String: Any],
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+    }
+
     private func stubHistoryResponse(ts: String, uniqueId: String) {
         let body = historyResponseJSON(ts: ts, uniqueId: uniqueId)
         HangingURLProtocol.responseProvider = { _ in
@@ -86,11 +137,14 @@ final class ModeSwitchIntegrationTests: XCTestCase {
         }
     }
 
-    /// 轮询等 handleModeChange() 把 vm.messages 清空 —— 它是模式切换真实副作用的一部分, 用它
-    /// 确认"切模式"这一步已经真的发生, 再进入"放行"步骤, 顺序对齐 spec 的"挂起→切模式→放行".
-    private func waitUntilMessagesCleared(_ vm: ChatViewModel, maxIterations: Int = 3000) async {
+    private func waitForTransitionToSettle(
+        _ vm: ChatViewModel,
+        after generation: Int,
+        maxIterations: Int = 3000
+    ) async {
         var i = 0
-        while !vm.messages.isEmpty && i < maxIterations {
+        while (vm.settledModeGeneration <= generation || vm.settledModeGeneration != vm.modeGeneration),
+              i < maxIterations {
             await Task.yield()
             i += 1
         }
@@ -112,6 +166,15 @@ final class ModeSwitchIntegrationTests: XCTestCase {
         ChatStore.shared.snapshot(.directAPI).delete(ids: [id])
     }
 
+    private func waitForStreamStarts(_ harness: DirectStreamHarness, count: Int) async -> Bool {
+        var i = 0
+        while harness.startCount < count && i < 3000 {
+            await Task.yield()
+            i += 1
+        }
+        return harness.startCount >= count
+    }
+
     // MARK: - fixed/buggy 两种"响应到达时落哪个 scope"实现, 正例负例共用
     //
     // fixed 冻结 scope 在网络 await 之前, buggy 在 await 之后才重新读 ambient DirectAPIConfig.mode ——
@@ -129,13 +192,13 @@ final class ModeSwitchIntegrationTests: XCTestCase {
         ChatStore.shared.snapshot(DirectAPIConfig.mode).upsert(records)
     }
 
-    // MARK: - 正例(硬门本体): 真实驱动 ChatViewModel.loadEarlier() 走完整异步时序
+    // MARK: - Tracked operation lifecycle
 
     /// 挂起 fake transport 的响应 → 用户切模式(ccServer → directAPI) → 放行 →
     /// 断言旧响应不落新模式库、UI 状态(vm.messages)不串.
-    func testDelayedLoadEarlierResponseStaysInEntryModeScope() async throws {
+    func testTrackedLoadEarlierCancelsBeforeTransitionAndCommitsNothing() async throws {
         let uniqueId = "loadEarlier-\(UUID().uuidString)"
-        let fixtureTs = "1999-01-01T00:00:00.000Z"
+        let fixtureTs = "1899-01-01T00:00:00.000Z"
         defer { cleanupFixture(ts: fixtureTs) }
         DirectAPIConfig.mode = .ccServer
 
@@ -147,7 +210,7 @@ final class ModeSwitchIntegrationTests: XCTestCase {
 
         // 掛起: entryMode(=ccServer) 在 loadEarlier() 入口就被冻结, 网络请求随后打进 HangingURLProtocol
         // 挂住不回应.
-        let opTask = Task { await vm.loadEarlier() }
+        let opTask = Task { await vm.loadEarlierTracked() }
         guard await HangingURLProtocol.waitForRequestReceived() else {
             XCTFail("fake transport 10s 内没收到请求 —— 被测函数大概率走了本地缓存分支提前返回, 没有真的发起网络请求")
             return
@@ -155,8 +218,9 @@ final class ModeSwitchIntegrationTests: XCTestCase {
 
         // 切模式: 走真实 DirectAPIConfig.mode setter → 真实 .ccDirectAPIModeChanged 通知 →
         // ChatViewModel 里注册的真实 handleModeChange() 观察者. 生产路径, 没有任何绕过.
+        let startingGeneration = vm.modeGeneration
         DirectAPIConfig.mode = .directAPI
-        await waitUntilMessagesCleared(vm)
+        await waitForTransitionToSettle(vm, after: startingGeneration)
         XCTAssertTrue(vm.messages.isEmpty, "mode 切换应该已经清空 UI messages(handleModeChange 的一部分)")
 
         // 放行: 挂起的响应现在才真正送达 loadEarlier() 内部的 await 点.
@@ -167,22 +231,309 @@ final class ModeSwitchIntegrationTests: XCTestCase {
         let ccServerHasIt = recordExists(in: ChatStore.shared.snapshot(.ccServer), text: fixtureText)
         let directAPIHasIt = recordExists(in: ChatStore.shared.snapshot(.directAPI), text: fixtureText)
 
-        XCTAssertTrue(ccServerHasIt, "延迟到达的响应应该落进发起请求时冻结的 ccServer scope")
+        XCTAssertFalse(ccServerHasIt, "tracked request 被 mode transition 取消后不应该提交旧响应")
         XCTAssertFalse(directAPIHasIt, "延迟到达的响应不应该落进切换后的 directAPI scope(串库)")
 
-        // 已知缺口(本轮测试补齐现场发现, 不在 spec 授权的 DI-only 范围内, 没有顺手改 ChatViewModel
-        // 生产逻辑): loadEarlier() 对物理库的 scope 冻结正确(上面两条断言真的 PASS), 但对 UI 可见
-        // 的 self.messages 写入没有做同款校验 —— 网络响应回来后无条件 `self.messages = newOnes +
-        // self.messages`, 不检查这条响应发起时的 entryMode 是否还等于当前模式. 用 XCTExpectFailure
-        // 而不是删掉/放宽断言: 断言本体保留(真实反映 spec 要求的"UI 状态不串"), 已知会红但不让它
-        // 拖垮整个 suite 的判读; 一旦生产代码修好这条自动变绿, XCTExpectFailure 会报"意外通过"提醒
-        // 删掉这个标记. 详见 result 文件"过程记录·发现"一节, 跟上一轮 review P0-1("仍可在新模式下
-        // 回写 messages")是同一类问题的具体复现, 不是本轮任务范围内的架构性修复, 留给产品决策方定
-        // 要不要现在补一个小范围 entryMode 校验或者并入 P0-1 一起处理.
-        XCTExpectFailure("已知缺口: loadEarlier() 的 self.messages 写入没有 entryMode 校验, 延迟响应会污染切换后的 UI —— 跟上一轮 review P0-1 同类, 见 result") {
-            let uiHasStaleRecord = vm.messages.contains { $0.text == fixtureText }
-            XCTAssertFalse(uiHasStaleRecord, "延迟到达的 ccServer 响应不应该污染切换后 directAPI 模式的 UI messages")
+        let uiHasStaleRecord = vm.messages.contains { $0.text == fixtureText }
+        XCTAssertFalse(uiHasStaleRecord, "延迟到达的 ccServer 响应不应该污染切换后 directAPI 模式的 UI messages")
+    }
+
+    func testRapidTripleLoadEarlierWaitsForTheOwnerChainAndStartsOnlyFinalReplacement() async {
+        let uniqueId = "repeated-load-\(UUID().uuidString)"
+        let fixtureTs = "1899-01-02T00:00:00.000Z"
+        defer { cleanupFixture(ts: fixtureTs) }
+        DirectAPIConfig.mode = .ccServer
+
+        let fakeClient = ChatNetworkClient(session: HangingURLProtocol.makeSession())
+        let vm = ChatViewModel(session: HangingURLProtocol.makeSession(), networkClient: fakeClient)
+        vm.messages = [seedAnchorMessage(idSuffix: uniqueId)]
+        stubHistoryResponse(ts: fixtureTs, uniqueId: uniqueId)
+
+        let first = Task { await vm.loadEarlierTracked() }
+        guard await HangingURLProtocol.waitForRequestReceived(count: 1) else {
+            XCTFail("first tracked request did not arrive")
+            return
         }
+
+        let second = Task { await vm.loadEarlierTracked() }
+        await Task.yield()
+        let third = Task { await vm.loadEarlierTracked() }
+        let replacementArrived = await HangingURLProtocol.waitForRequestReceived(count: 2, timeout: 0.5)
+        let orphanArrived = await HangingURLProtocol.waitForRequestReceived(count: 3, timeout: 0.2)
+        await HangingURLProtocol.release()
+        await first.value
+        await second.value
+        await third.value
+
+        XCTAssertTrue(replacementArrived, "replacement request must start after the cancelled owner exits")
+        XCTAssertFalse(orphanArrived, "superseded replacement must not overwrite the final owner and start as an orphan")
+    }
+
+    func testFastDoubleSwitchLeavesOneFinalBootstrapOwner() async {
+        let uniqueId = "double-switch-\(UUID().uuidString)"
+        let fixtureTs = "1899-01-03T00:00:00.000Z"
+        defer { cleanupFixture(ts: fixtureTs) }
+        DirectAPIConfig.mode = .ccServer
+
+        let fakeClient = ChatNetworkClient(session: HangingURLProtocol.makeSession())
+        let vm = ChatViewModel(session: HangingURLProtocol.makeSession(), networkClient: fakeClient)
+        vm.messages = [seedAnchorMessage(idSuffix: uniqueId)]
+        stubHistoryResponse(ts: fixtureTs, uniqueId: uniqueId)
+
+        let oldLoad = Task { await vm.loadEarlierTracked() }
+        guard await HangingURLProtocol.waitForRequestReceived(count: 1) else {
+            XCTFail("tracked request did not arrive")
+            return
+        }
+
+        let startingGeneration = vm.modeGeneration
+        DirectAPIConfig.mode = .directAPI
+        DirectAPIConfig.mode = .ccServer
+
+        await waitForTransitionToSettle(vm, after: startingGeneration)
+        let finalBootstrapArrived = await HangingURLProtocol.waitForRequestReceived(count: 2, timeout: 1)
+        let thirdRequestArrived = await HangingURLProtocol.waitForRequestReceived(count: 3, timeout: 0.2)
+        let bootstrapRequests = HangingURLProtocol.capturedRequests.filter {
+            URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?.contains(URLQueryItem(name: "limit", value: "500")) == true
+        }
+
+        await HangingURLProtocol.release()
+        await oldLoad.value
+        vm.stop()
+
+        XCTAssertTrue(finalBootstrapArrived, "final mode must launch its bootstrap owner")
+        XCTAssertFalse(thirdRequestArrived, "coalesced transition must not launch a second final bootstrap")
+        XCTAssertEqual(bootstrapRequests.count, 1, "only the final mode may own a bootstrap task")
+        XCTAssertEqual(vm.modeGeneration, startingGeneration + 2)
+        XCTAssertEqual(vm.settledModeGeneration, vm.modeGeneration)
+    }
+
+    func testRepeatedSearchKeepsOnlyReplacementResult() async {
+        let fixtureTs = "1899-04-01T00:00:00.000Z"
+        defer { cleanupFixture(ts: fixtureTs) }
+        let firstQuery = "first-\(UUID().uuidString)"
+        let secondQuery = "second-\(UUID().uuidString)"
+        DirectAPIConfig.mode = .ccServer
+
+        HangingURLProtocol.responseProvider = { request in
+            let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "q" })?.value ?? "missing"
+            return HangingURLProtocol.StubResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: self.historyResponseJSON(ts: fixtureTs, text: "result-\(query)")
+            )
+        }
+        let vm = ChatViewModel(session: HangingURLProtocol.makeSession())
+        vm.searchText = firstQuery
+        let first = Task { await vm.searchServerTracked() }
+        guard await HangingURLProtocol.waitForRequestReceived(count: 1) else {
+            XCTFail("first search request did not arrive")
+            return
+        }
+
+        vm.searchText = secondQuery
+        let second = Task { await vm.searchServerTracked() }
+        let replacementArrived = await HangingURLProtocol.waitForRequestReceived(count: 2, timeout: 0.5)
+        await HangingURLProtocol.release()
+        await first.value
+        await second.value
+
+        XCTAssertTrue(replacementArrived)
+        XCTAssertEqual(vm.serverSearchResults.map(\.text), ["result-\(secondQuery)"])
+    }
+
+    func testRepeatedResyncReplacesBackfillOwnerDuringBootstrap() async {
+        let seedTs = "1899-06-01T00:00:00.000Z"
+        let seed = ChatMessage(
+            ts: seedTs, role: "user", text: "resync-seed-\(UUID().uuidString)", source: nil,
+            quotedTs: nil, quotedText: nil, attachmentUrl: nil, attachmentType: nil,
+            attachmentFilename: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+            location: nil, metadata: nil, localId: nil
+        )
+        let previousBackfillFlag = UserDefaults.standard.object(forKey: "backfillComplete_v2")
+        defer {
+            cleanupFixture(ts: seedTs, role: "user")
+            if let previousBackfillFlag {
+                UserDefaults.standard.set(previousBackfillFlag, forKey: "backfillComplete_v2")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "backfillComplete_v2")
+            }
+        }
+        DirectAPIConfig.mode = .ccServer
+        ChatStore.shared.snapshot(.ccServer).upsert([seed])
+        HangingURLProtocol.responseProvider = { _ in
+            HangingURLProtocol.StubResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: Data(#"{"ok":true,"records":[]}"#.utf8)
+            )
+        }
+        let fakeClient = ChatNetworkClient(session: HangingURLProtocol.makeSession())
+        let vm = ChatViewModel(session: HangingURLProtocol.makeSession(), networkClient: fakeClient)
+        let pendingCount = vm.pendingFailedMessages.count
+
+        await vm.start()
+        guard await HangingURLProtocol.waitForRequestReceived(count: 1) else {
+            XCTFail("bootstrap request did not arrive")
+            return
+        }
+
+        NotificationCenter.default.post(name: NSNotification.Name("CcResyncHistory"), object: nil)
+        let firstBackfillArrived = await HangingURLProtocol.waitForRequestReceived(count: 2, timeout: 0.3)
+        NotificationCenter.default.post(name: NSNotification.Name("CcResyncHistory"), object: nil)
+        let replacementBackfillArrived = await HangingURLProtocol.waitForRequestReceived(count: 3, timeout: 0.3)
+
+        let startingGeneration = vm.modeGeneration
+        DirectAPIConfig.mode = .directAPI
+        await waitForTransitionToSettle(vm, after: startingGeneration)
+        await HangingURLProtocol.release()
+        vm.stop()
+
+        let backfillRequests = HangingURLProtocol.capturedRequests.filter {
+            URLComponents(url: $0.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?.contains(where: { $0.name == "before" }) == true
+        }
+        XCTAssertTrue(firstBackfillArrived)
+        XCTAssertTrue(replacementBackfillArrived)
+        XCTAssertEqual(backfillRequests.count, 2)
+        XCTAssertNil(vm.backfillProgress)
+        XCTAssertEqual(vm.pendingFailedMessages.count, pendingCount)
+    }
+
+    func testRepeatedJumpToDateKeepsOnlyReplacementTarget() async {
+        let firstTs = "1800-01-01T00:00:00.000Z"
+        let secondTs = "1800-01-02T00:00:00.000Z"
+        defer {
+            cleanupFixture(ts: firstTs)
+            cleanupFixture(ts: secondTs)
+        }
+        DirectAPIConfig.mode = .ccServer
+
+        HangingURLProtocol.responseProvider = { request in
+            let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)
+            let day = components?.queryItems?.first(where: { $0.name == "date" })?.value
+            let around = components?.queryItems?.first(where: { $0.name == "around_ts" })?.value
+            let ts = around ?? (day == "1800-01-01" ? firstTs : secondTs)
+            return HangingURLProtocol.StubResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: self.historyResponseJSON(ts: ts, text: "jump-\(ts)")
+            )
+        }
+        let vm = ChatViewModel(session: HangingURLProtocol.makeSession())
+        let first = Task { await vm.jumpToDateTracked("1800-01-01") }
+        guard await HangingURLProtocol.waitForRequestReceived(count: 1) else {
+            XCTFail("first jump request did not arrive")
+            return
+        }
+
+        let second = Task { await vm.jumpToDateTracked("1800-01-02") }
+        let replacementArrived = await HangingURLProtocol.waitForRequestReceived(count: 2, timeout: 0.5)
+        await HangingURLProtocol.release()
+        await first.value
+        await second.value
+
+        XCTAssertTrue(replacementArrived)
+        XCTAssertEqual(vm.jumpScrollTarget, secondTs + "assistant")
+    }
+
+    func testDirectModeAppPathsCaptureNoServerRequests() async {
+        DirectAPIConfig.mode = .directAPI
+        let fakeClient = ChatNetworkClient(session: HangingURLProtocol.makeSession())
+        let vm = ChatViewModel(session: HangingURLProtocol.makeSession(), networkClient: fakeClient)
+
+        await vm.start()
+        await Task.yield()
+        vm.messages = [seedAnchorMessage(idSuffix: UUID().uuidString)]
+        await vm.loadEarlierTracked()
+        vm.searchText = "zero-capture-\(UUID().uuidString)"
+        await vm.searchServerTracked()
+        let target = ChatMessage(
+            ts: "1800-02-01T00:00:00.000Z", role: "assistant", text: "target", source: nil,
+            quotedTs: nil, quotedText: nil, attachmentUrl: nil, attachmentType: nil,
+            attachmentFilename: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+            location: nil, metadata: nil, localId: nil
+        )
+        await vm.jumpToMessageTracked(target)
+        vm.stop()
+
+        XCTAssertTrue(HangingURLProtocol.capturedRequests.isEmpty)
+    }
+
+    func testDirectToServerTransitionClearsModeScopedState() async {
+        let markerTs = "1899-05-01T00:00:00.000Z"
+        let markerText = "reverse-switch-\(UUID().uuidString)"
+        defer { cleanupFixture(ts: markerTs) }
+        DirectAPIConfig.mode = .directAPI
+        let fakeClient = ChatNetworkClient(session: HangingURLProtocol.makeSession())
+        let vm = ChatViewModel(session: HangingURLProtocol.makeSession(), networkClient: fakeClient)
+        let marker = ChatMessage(
+            ts: markerTs, role: "assistant", text: markerText, source: "direct-api",
+            quotedTs: nil, quotedText: nil, attachmentUrl: nil, attachmentType: nil,
+            attachmentFilename: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+            location: nil, metadata: nil, localId: nil
+        )
+        ChatStore.shared.snapshot(.directAPI).upsert([marker])
+        vm.messages = [marker]
+        vm.serverSearchResults = [marker]
+        vm.jumpScrollTarget = marker.id
+        vm.loadingEarlier = true
+        vm.isServerSearching = true
+        vm.sending = true
+        vm.backfillProgress = .running(synced: 1)
+        let pendingCount = vm.pendingFailedMessages.count
+        let startingGeneration = vm.modeGeneration
+
+        DirectAPIConfig.mode = .ccServer
+        await waitForTransitionToSettle(vm, after: startingGeneration)
+        vm.stop()
+
+        XCTAssertFalse(vm.messages.contains { $0.text == markerText })
+        XCTAssertTrue(vm.serverSearchResults.isEmpty)
+        XCTAssertFalse(vm.loadingEarlier)
+        XCTAssertFalse(vm.isServerSearching)
+        XCTAssertFalse(vm.sending)
+        XCTAssertNil(vm.backfillProgress)
+        XCTAssertNil(vm.jumpScrollTarget)
+        XCTAssertEqual(vm.pendingFailedMessages.count, pendingCount)
+        XCTAssertTrue(recordExists(in: ChatStore.shared.snapshot(.directAPI), text: markerText))
+        XCTAssertFalse(recordExists(in: ChatStore.shared.snapshot(.ccServer), text: markerText))
+    }
+
+    func testRepeatedDirectSendRemovesCancelledPlaceholderAndKeepsOneOwner() async {
+        DirectAPIConfig.mode = .directAPI
+        let harness = DirectStreamHarness()
+        let vm = ChatViewModel(
+            directAPIStream: { _, _, _, _, _, _ in harness.makeStream() },
+            directAPIKeyProvider: { "integration-test-key" }
+        )
+        let prefix = "repeat-send-\(UUID().uuidString)"
+        defer {
+            let ids = Set(vm.messages.filter { $0.text.contains(prefix) || $0.source == "direct-api" }.map { $0.id })
+            ChatStore.shared.snapshot(.directAPI).delete(ids: ids)
+        }
+
+        await vm.send(text: "\(prefix)-one")
+        let firstStarted = await waitForStreamStarts(harness, count: 1)
+        XCTAssertTrue(firstStarted)
+        let second = Task { await vm.send(text: "\(prefix)-two") }
+        let secondStarted = await waitForStreamStarts(harness, count: 2)
+        XCTAssertTrue(secondStarted)
+        harness.finishLatest(with: "stream-final")
+        await second.value
+
+        var i = 0
+        while (vm.sending || !vm.messages.contains(where: { $0.text == "stream-final" })) && i < 3000 {
+            await Task.yield()
+            i += 1
+        }
+        let assistantMessages = vm.messages.filter { $0.source == "direct-api" }
+
+        XCTAssertEqual(harness.activeCount, 0)
+        XCTAssertEqual(assistantMessages.map { $0.text }, ["stream-final"])
+        XCTAssertTrue(vm.pendingFailedMessages.isEmpty)
     }
 
     // MARK: - 负例: 证明测试本身有牙(上一轮 review 原話點名)
@@ -191,7 +542,7 @@ final class ModeSwitchIntegrationTests: XCTestCase {
     /// 这半场通过是下一条 buggy 测试有意义的前提(不然没法证明区分力来自 harness 而不是巧合).
     func testFixedScopeFreezing_doesNotCrossContaminate() async throws {
         let uniqueId = "fixed-\(UUID().uuidString)"
-        let fixtureTs = "1999-02-01T00:00:00.000Z"
+        let fixtureTs = "1899-02-01T00:00:00.000Z"
         defer { cleanupFixture(ts: fixtureTs) }
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/history")
         DirectAPIConfig.mode = .ccServer
@@ -221,7 +572,7 @@ final class ModeSwitchIntegrationTests: XCTestCase {
     /// 如果这两条断言失败, 说明 harness 本身测不出串库, 上一条 fixed 测试的 PASS 就不可信.
     func testAmbientModeRead_crossContaminates_provingTestHasTeeth() async throws {
         let uniqueId = "buggy-\(UUID().uuidString)"
-        let fixtureTs = "1999-03-01T00:00:00.000Z"
+        let fixtureTs = "1899-03-01T00:00:00.000Z"
         defer { cleanupFixture(ts: fixtureTs) }
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/history")
         DirectAPIConfig.mode = .ccServer
