@@ -13,6 +13,7 @@ import Foundation
 import Combine
 import AudioToolbox
 import UserNotifications
+import DirectAPICore
 #if canImport(PhotosUI)
 import PhotosUI
 #endif
@@ -509,12 +510,22 @@ enum ChatNetworkError: Error, LocalizedError {
 actor ChatNetworkClient {
     static let shared = ChatNetworkClient()
 
-    private let session: URLSession = {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 30
-        cfg.timeoutIntervalForResource = 30
-        return URLSession(configuration: cfg)
-    }()
+    // 二审(P0-2): registerClass 全局注册覆盖不到显式 configuration, 必须经 ccGuarded() 工厂显式注入
+    // guard protocol —— 见 DirectAPICore/ServerGuardTests, fresh Foundation 对照 probe 坐实这条.
+    private let session: URLSession
+
+    // 集成测试补齐(P0 四审前置): 唯一注入点 —— 不传时逐字节复刻改动前的硬编码构造, 生产 `.shared`
+    // 零行为变化. 测试注入可挂起/可放行的 fake transport, 驱动"挂起响应→切模式→放行"的端到端时序.
+    init(session: URLSession? = nil) {
+        if let session {
+            self.session = session
+        } else {
+            let cfg = DirectAPIServerGuardProtocol.ccGuarded()
+            cfg.timeoutIntervalForRequest = 30
+            cfg.timeoutIntervalForResource = 30
+            self.session = URLSession(configuration: cfg)
+        }
+    }
 
     func fetchPoll(since: String?, etag: String?) async throws -> ChatPollResponse {
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/poll")
@@ -724,8 +735,37 @@ final class ChatViewModel: ObservableObject {
     }
     // Phase 3 (build 223): silent push 带 turn_id 到达 → 直接拉 thinking, 不等下一次 chat poll.
     private var thinkingPushObserver: NSObjectProtocol?
+    // P0 直连: 之前未被任何地方持有的 detached backfill / resync 监听 / directAPI 发送任务, 现在存住句柄
+    // 才能被 stopAndWait() 真正取消并等它们退出 —— code review 抓到(critical): dbQueue 是运行时 computed
+    // 路由, 不存句柄就没法在模式切换时打断在途操作, 会把旧模式的数据写进新模式的库.
+    private var backfillTask: Task<Void, Never>? = nil
+    private var directAPISendTask: Task<Void, Never>? = nil
+    // "重新同步全部历史" notification 监听是独立创建的 Task, 不会因 pollingTask 被取消而自动退出
+    // (Swift 结构化并发的取消传播只覆盖 async let/task group 的子任务, 不含这种手动 Task{}).
+    private var resyncListenerTask: Task<Void, Never>? = nil
+    // 二审(P0-1): loadEarlier/searchServer/jumpToMessage(含 jumpToDate) 之前是 SwiftUI .refreshable /
+    // searchDebounceTask / 散落 Task{} 各自起的裸 Task, stopAndWait() 完全看不到它们——"先离开 chat 去
+    // 设置页, 再改模式"这条路径切换时无法等它们退出. 现在这三类操作统一走 xxxTracked() 包装方法, 由
+    // ViewModel 自己持有句柄, 不管从哪个 UI 入口触发, stopAndWait() 都能真等到.
+    private var loadEarlierTask: Task<Void, Never>? = nil
+    private var searchServerTask: Task<Void, Never>? = nil
+    private var jumpToMessageTask: Task<Void, Never>? = nil
+    private var jumpToDateTask: Task<Void, Never>? = nil
+    private var modeChangeObserver: NSObjectProtocol?
 
-    init() {
+    // 集成测试补齐(P0 四审前置): session/networkClient 可选注入, 不传时逐字节复刻改动前的硬编码
+    // 构造 —— 生产调用点 `ChatViewModel()` 零改动零行为变化, 测试用 `ChatViewModel(session:networkClient:)`
+    // 传入可挂起/可放行的 fake transport.
+    init(session: URLSession? = nil, networkClient: ChatNetworkClient? = nil) {
+        if let session {
+            self.session = session
+        } else {
+            let cfg = DirectAPIServerGuardProtocol.ccGuarded()
+            cfg.timeoutIntervalForRequest = 12
+            cfg.timeoutIntervalForResource = 20
+            self.session = URLSession(configuration: cfg)
+        }
+        self.networkClient = networkClient ?? .shared
         thinkingPushObserver = NotificationCenter.default.addObserver(
             forName: .ccThinkingPending, object: nil, queue: .main
         ) { [weak self] note in
@@ -733,6 +773,56 @@ final class ChatViewModel: ObservableObject {
             // force: silent push 代表 server 此刻已有这条 thinking, 即使 poll 路已 give-up 也要补拉.
             Task { @MainActor in self?.fetchThinkingForTurn(tid, force: true) }
         }
+        // P0 直连: 模式切换是显式生命周期事件 — 取消旧模式在途任务(poll/backfill/resync监听/SSE)全部
+        // 退出后, 清空 UI 态从新模式的本地库重新加载, 不依赖"调用点下次读到新 mode 就自动对".
+        modeChangeObserver = NotificationCenter.default.addObserver(
+            forName: .ccDirectAPIModeChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in await self?.handleModeChange() }
+        }
+    }
+
+    /// 停 + 真等旧任务退出(不只是发 cancel 信号) —— 模式切换用这个, 不能提前进 start() 的新 scope,
+    /// 否则旧任务还在跑的时候新任务已经开始, 两边都可能在过渡窗口写各自的库(结果是对的, 但徒增竞争).
+    /// 一般的 view 消失(.onDisappear)用同步的 stop() 就够, 不需要等(反正 view 都不在了不急着立刻回收).
+    ///
+    /// 二审(P0-1): pending 句柄清单在 `stop()` 之前先原样捕获, `stop()` 本身不再清句柄(见 stop() 注释)——
+    /// 只有这里在真正 await 到全部任务退出之后才清, 不然"onDisappear 先同步 stop(), 稍后模式切换才
+    /// 走 stopAndWait()"这条路径会拿到一个已经被提前清空的句柄清单, 明明任务还没退出却当作无需等待.
+    private func stopAndWait() async {
+        let pending: [Task<Void, Never>] = [
+            pollingTask, backfillTask, directAPISendTask, resyncListenerTask,
+            loadEarlierTask, searchServerTask, jumpToMessageTask, jumpToDateTask,
+        ].compactMap { $0 }
+        stop()
+        for task in pending { await task.value }
+        pollingTask = nil
+        backfillTask = nil
+        directAPISendTask = nil
+        resyncListenerTask = nil
+        loadEarlierTask = nil
+        searchServerTask = nil
+        jumpToMessageTask = nil
+        jumpToDateTask = nil
+    }
+
+    /// 模式切换处理: 先停(取消 poll/backfill/resync监听/directAPI send 四类在途任务并真等它们退出 —
+    /// 这是这次修复的核心, 不等就会出现 review 抓到的那个 critical bug: 旧模式的在途操作在新模式生效后才
+    /// 完成, 写进新模式的库), 清掉 messages(避免两个模式的历史混在一起显示), 再从新模式对应的本地库
+    /// 重新 bootstrap.
+    /// 有意不动 pendingFailedMessages/sendingIds/failedIds(ccServer 专用重试队列, 清了没有对应恢复机制
+    /// 会在切回 ccServer 时丢显示, 比留着不动更糟——这次修复范围只到"不写错库", 不做全量状态机重设计).
+    /// restorePendingFailedMessages() 本身已经 gate 了 directAPI 模式不恢复(见该方法), 这里不用重复处理.
+    /// lastTs/settingsEtag 不用手动清: start() 里 loadCachedHistory() 马上会用新模式的本地数据覆盖它们.
+    private func handleModeChange() async {
+        await stopAndWait()
+        messages = []
+        displayedRowsCache = []
+        thinkingByTurn = [:]
+        thinkingPlaceholderSince = [:]
+        thinkingFetchedTurns = []
+        thinkingInFlightTurns = []
+        start()
     }
     @Published private(set) var visibleLimit: Int = 300 { didSet { rebuildDisplayedRowsCache() } }
 
@@ -1078,12 +1168,11 @@ final class ChatViewModel: ObservableObject {
         UserDefaults.standard.object(forKey: "notify_on_polling_assistant") as? Bool ?? true
     }
     let chatStore = ChatStore.shared
-    private let session: URLSession = {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 12
-        cfg.timeoutIntervalForResource = 20
-        return URLSession(configuration: cfg)
-    }()
+    // 二审(P0-2): 同上, 经 ccGuarded() 工厂显式注入 guard protocol.
+    private let session: URLSession
+    // 集成测试补齐(P0 四审前置): 同 ChatNetworkClient 的注入点 —— ChatViewModel 内部原本硬编码
+    // ChatNetworkClient.shared 的调用点全部改走这个属性, 不传时就是 .shared, 生产行为零变化.
+    private let networkClient: ChatNetworkClient
 
     func start() {
         print("[chat-hydrate] start called")
@@ -1091,26 +1180,32 @@ final class ChatViewModel: ObservableObject {
         pollingTask = Task { [weak self] in
             // 2026-05-07 hotfix removed: enforceCacheCap 是 SwiftData 卡 search 时代的兜底 GRDB+FTS5 全量搜不需要 cap
             await self?.loadCachedHistory()
+            // P0 直连: loadCachedHistory 已经从(路由到 directAPI 库的) chatStore 载入本地历史.
+            // directAPI 模式不轮询 /chat/poll、不拉 server history、不 backfill — 到此为止.
+            guard !DirectAPIConfig.isActive else { return }
             await self?.bootstrapHistory()
             await self?.pollOnce()
             // Phase 设置大砍 (item B) — populate favorite cache so bookmark icons render correctly
             await FavoritedTurnsCache.shared.refreshFromServer()
             // 2026-05-07 Phase 2: 后台 backfill 限 5000 条 (不再全量 13322 卡 search)
-            Task.detached(priority: .background) { [weak self] in
+            // P0 直连(code review P0-1): 存句柄而不是 fire-and-forget —— stopAndWait() 才能真取消它,
+            // 不然它会在网络等待期间用户切到 directAPI 之后才落库, 写进错误的物理库.
+            self?.backfillTask = Task.detached(priority: .background) { [weak self] in
                 await self?.backfillHistory()
             }
-            // 2026-05-09 用户 push 设置里手动触发 "重新同步全部历史" 监听 notification 重跑 backfill
-            let notifTask = Task { [weak self] in
+            // 2026-05-09 用户 push 设置里手动触发 "重新同步全部历史" 监听 notification 重跑 backfill.
+            // 这个监听本身也要存句柄: 它是独立创建的 Task, 不会因为 pollingTask 被取消而自动退出
+            // (Swift 结构化并发只自动传播取消给 async let/task group 的子任务, 不含这种独立 Task{}).
+            self?.resyncListenerTask = Task { [weak self] in
                 let stream = NotificationCenter.default.notifications(named: NSNotification.Name("CcResyncHistory"))
                 for await _ in stream {
                     guard let self else { return }
                     UserDefaults.standard.set(false, forKey: "backfillComplete_v2")
-                    Task.detached(priority: .background) { [weak self] in
+                    self.backfillTask = Task.detached(priority: .background) { [weak self] in
                         await self?.backfillHistory()
                     }
                 }
             }
-            _ = notifTask
             while !Task.isCancelled {
                 let delay = self?.pollDelaySeconds() ?? 5
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -1133,7 +1228,7 @@ final class ChatViewModel: ObservableObject {
     private func pollOnce() async {
         sweepStaleThinkingPlaceholders()   // H3 兜底: 每 tick 清扫僵尸占位, 不依赖 scenePhase 变化
         do {
-            let response = try await ChatNetworkClient.shared.fetchPoll(since: lastTs, etag: settingsEtag)
+            let response = try await networkClient.fetchPoll(since: lastTs, etag: settingsEtag)
             recordNetworkSuccess()
             pollingFailureCount = 0
             isCcTyping = response.status.isTyping ?? (response.status.status == "typing")
@@ -1145,7 +1240,9 @@ final class ChatViewModel: ObservableObject {
             }
             if !response.chat.newRecords.isEmpty {
                 let existingIds = Set(messages.map(\.id))
-                chatStore.upsert(response.chat.newRecords)
+                // pollOnce 只在 ccServer 模式跑(directAPI 早退于 start()), 冻死 scope 关掉网络等待期间
+                // 切模式导致 poll 结果写错库的同类竞态(code review P0-1 名指的是 backfill/SSE, 同一个类).
+                chatStore.snapshot(.ccServer).upsert(response.chat.newRecords)
                 mergeUnique(response.chat.newRecords)
                 notifyPollingAssistantMessages(response.chat.newRecords, existingIds: existingIds)
                 reconcileLocalSendState()
@@ -1216,6 +1313,7 @@ final class ChatViewModel: ObservableObject {
 
     func fetchThinkingForTurn(_ tid: String, force: Bool = false) {
         guard !tid.isEmpty else { return }
+        guard !DirectAPIConfig.isActive else { return }  // P0 直连: 不打 server /v1/thinking
         if thinkingByTurn[tid] != nil { return }          // 已成功拉到 → 不重复
         // silent push 代表"server 此刻已有这条 thinking" → 即使 poll 路已 give-up 也允许重新拉.
         if force { thinkingFetchedTurns.remove(tid) }
@@ -1231,7 +1329,7 @@ final class ChatViewModel: ObservableObject {
             let delays: [UInt64] = [0, 1, 2, 3, 5, 8, 10, 15, 20, 25].map { UInt64($0) * 1_000_000_000 }
             for (i, delay) in delays.enumerated() {
                 if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
-                if let text = await ChatNetworkClient.shared.fetchThinking(turnId: tid) {
+                if let text = await networkClient.fetchThinking(turnId: tid) {
                     await MainActor.run { self?.thinkingTurnLoaded(tid, text: text) }
                     return
                 }
@@ -1383,10 +1481,14 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func refreshRecent() async {
+        // 二审(P0-1): refreshRecent 只被 pollOnce() 调用, 架构上恒在 ccServer 分支(directAPI 早退于
+        // start()), 硬编码 .ccServer 冻结 scope 跟 backfillHistory/pollOnce 已有的写法一致 —— 不读
+        // ambient chatStore(网络等待期间用户切模式, 结果落库会跟着 ambient 现算的新模式走错库).
+        let store = chatStore.snapshot(.ccServer)
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/history")
         guard let withQuery = URL(string: url.absoluteString + "?limit=50") else { return }
         do {
-            let records = try await ChatNetworkClient.shared.fetchHistory(url: withQuery)
+            let records = try await networkClient.fetchHistory(url: withQuery)
             recordNetworkSuccess()
             // 用 id-keyed map 合并 — 若 ts 已存在替换 (reaction / edit) / 不存在 append
             var byId: [String: Int] = [:]
@@ -1406,7 +1508,7 @@ final class ChatViewModel: ObservableObject {
                 }
             }
             if appended { _sortMessages() }
-            self.chatStore.upsert(records)
+            store.upsert(records)
             reconcileLocalSendState()
         } catch {
             // 静默
@@ -1464,26 +1566,63 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// 二审(P0-1): 只发 cancel 信号, 不清句柄——句柄留给可能紧跟着来的 stopAndWait() 去真正 await 到
+    /// 任务退出。一审版本这里 cancel 完立刻把句柄置 nil, "onDisappear 走这个同步 stop() → 稍后在设置页
+    /// 切模式触发 stopAndWait()"这条路径下, stopAndWait() 拿到的 pending 数组会因为句柄已经被这里
+    /// 提前清空而是空的——旧任务其实还没退出(cancel 只是请求, 不保证立刻停), 完成时仍可能用 ambient
+    /// facade 写进切换后的错误物理库。start() 里各任务自己会 `?.cancel()` 后无条件重新赋值, 不依赖
+    /// 这里先置 nil, 所以不清句柄不影响正常重启。
     func stop() {
         pollingTask?.cancel()
-        pollingTask = nil
+        backfillTask?.cancel()
+        directAPISendTask?.cancel()
+        resyncListenerTask?.cancel()
+        loadEarlierTask?.cancel()
+        searchServerTask?.cancel()
+        jumpToMessageTask?.cancel()
+        jumpToDateTask?.cancel()
+    }
+
+    /// UI 入口统一走这个(pull-to-refresh / 其它触发点), 不直接裸调 loadEarlier() —— 内部把 Task
+    /// 句柄存进 loadEarlierTask, stopAndWait() 才能真等到它退出; 同时仍可被调用方 await
+    /// (.refreshable 的下拉 spinner 需要真等完成才收起), 两头都满足.
+    func loadEarlierTracked() async {
+        loadEarlierTask?.cancel()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.loadEarlier()
+        }
+        loadEarlierTask = task
+        await task.value
     }
 
     func loadEarlier() async {
         guard !loadingEarlier, hasMoreEarlier else { return }
         guard let oldest = messages.first?.ts else { return }
+        // 二审(P0-1): 入口就冻结 scope + 记住当时的 mode —— 网络等待期间用户切模式, 后续读写全部沿用
+        // 这份进入时刻的身份, 不重新读 ambient DirectAPIConfig.mode / facade chatStore.current.
+        let entryMode = DirectAPIConfig.mode
+        let store = chatStore.snapshot(entryMode)
         await MainActor.run { self.loadingEarlier = true }
         defer { Task { @MainActor in self.loadingEarlier = false } }
-        let cached = chatStore.before(ts: oldest, limit: 200)
+        let cached = store.before(ts: oldest, limit: 200)
         if !cached.isEmpty {
             let existingIds = Set(self.messages.map { $0.id })
             let newOnes = cached.filter { !existingIds.contains($0.id) }
             if !newOnes.isEmpty {
                 self.messages = newOnes + self.messages
                 self.expandVisibleWindow(by: 200)
-                self.hasMoreEarlier = chatStore.before(ts: newOnes.first?.ts ?? oldest, limit: 1).isEmpty == false
+                self.hasMoreEarlier = store.before(ts: newOnes.first?.ts ?? oldest, limit: 1).isEmpty == false
                 return
             }
+        }
+        // 二审(P0-2 漏网路径): directAPI 本地没有更早记录时, 之前这里会无条件 fallback 到 ccServer
+        // /chat/history(用的正是 ChatViewModel.session 这枚自建 session)——这正是二审抓到的可达路径:
+        // directAPI 冷启动 + 首条消息后下拉。directAPI 没有 server 可 fallback, 到此为止(网络层 guard
+        // 本该也拦得住这条请求, 这里是功能层入口再挡一道, 不能只靠网络层报错).
+        guard entryMode == .ccServer else {
+            await MainActor.run { self.hasMoreEarlier = false }
+            return
         }
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/history")
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
@@ -1493,7 +1632,7 @@ final class ChatViewModel: ObservableObject {
         ]
         guard let finalURL = components?.url else { return }
         do {
-            let records = try await ChatNetworkClient.shared.fetchHistory(url: finalURL)
+            let records = try await networkClient.fetchHistory(url: finalURL)
             recordNetworkSuccess()
             if records.isEmpty {
                 await MainActor.run { self.hasMoreEarlier = false }
@@ -1508,7 +1647,7 @@ final class ChatViewModel: ObservableObject {
                 } else {
                     self.messages = newOnes + self.messages
                     self.expandVisibleWindow(by: 200)
-                    self.chatStore.upsert(newOnes)
+                    store.upsert(newOnes)
                 }
             }
         } catch {
@@ -1520,12 +1659,16 @@ final class ChatViewModel: ObservableObject {
         // 后台同步全量进 SwiftData，UI 仍只渲染最近 200 条，避免 List 一次性吃上万行。
         // 5-2 23:02 用户 catch 卡死: chatStore.upsert(3963 条) 在主线程阻塞 UI
         // 修: messages = latest 200 条立刻显示 + upsertAsync 分批 yield 后台慢慢写
+        // 二审(P0-1): bootstrapHistory 只在 start() 里 `guard !DirectAPIConfig.isActive` 之后调用,
+        // 架构上恒在 ccServer 分支, 硬编码 .ccServer 冻结 scope —— 不读 ambient chatStore(500 条全量
+        // 网络等待 + 分批 upsertAsync 跨很多 await 点, 期间用户切模式, ambient 现算会写错库).
+        let store = chatStore.snapshot(.ccServer)
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/history")
         guard let withQuery = URL(string: url.absoluteString + "?limit=500") else {
             return
         }
         do {
-            let records = try await ChatNetworkClient.shared.fetchHistory(url: withQuery)
+            let records = try await networkClient.fetchHistory(url: withQuery)
             recordNetworkSuccess()
             // 先把最近 200 条给 UI 显示 (立刻 不等 SwiftData 写完)
             var latest = Array(records.suffix(200))
@@ -1536,8 +1679,8 @@ final class ChatViewModel: ObservableObject {
             self.lastTs = records.last?.ts
             self.hasMoreEarlier = records.count >= 200
             // SwiftData 全量 upsert 异步分批 不阻塞 UI
-            await self.chatStore.upsertAsync(records)
-            self.hasMoreEarlier = records.count >= 200 || self.chatStore.before(ts: latest.first?.ts ?? "", limit: 1).isEmpty == false
+            await store.upsertAsync(records)
+            self.hasMoreEarlier = records.count >= 200 || store.before(ts: latest.first?.ts ?? "", limit: 1).isEmpty == false
         } catch {
             self.lastError = "拉历史失败: \(error.localizedDescription)"
         }
@@ -1595,13 +1738,17 @@ final class ChatViewModel: ObservableObject {
         return merged.sorted(by: Self.chatMessageAscending)
     }
 
+    // appendUnique/mergeUnique 只服务 ccServer 路径(directAPI 用 appendUniqueLocalOnly/updateLocalMessageText,
+    // 故意不复用这两个 — 见 sendDirectAPI 旁注). code review P0-1: 硬编码 .ccServer scope 而不是读 ambient
+    // chatStore(会跨 await 重新读全局模式), 关掉 poll 路径同一类竞态(不用像 backfill/sendDirectAPI 那样
+    // 大改调用方, 因为这两个方法全仓只被 ccServer 场景调用, 冻死 scope 没有副作用).
     private func appendUnique(_ rec: ChatMessage) {
         // 2026-05-12: don't persist optimistic records into GRDB — they're
         // UI-only until the server echoes back a canonical record. Identify
         // optimistic by the `localId` field (the `ts` is now real ISO and
         // indistinguishable from server ts).
         if rec.localId == nil {
-            chatStore.upsert([rec])
+            chatStore.snapshot(.ccServer).upsert([rec])
         }
         if !self.messages.contains(where: { $0.id == rec.id }) {
             self.messages.append(rec)
@@ -1613,7 +1760,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func mergeUnique(_ records: [ChatMessage]) {
-        chatStore.upsert(records)
+        chatStore.snapshot(.ccServer).upsert(records)
         let existing = Set(self.messages.map { $0.id })
         var added = false
         for r in records where !existing.contains(r.id) {
@@ -1648,6 +1795,9 @@ final class ChatViewModel: ObservableObject {
     }
 
     func upload(data: Data, filename: String, caption: String = "", quotedTs: String? = nil) async {
+        // P0 直连: 附件上传打 server /chat/upload, directAPI 没有这条路. UI 入口(picker/camera 按钮)已
+        // gate, 这里再挡一道防未来新增入口漏 gate(仿 fetchThinkingForTurn 同款 defense-in-depth).
+        guard !DirectAPIConfig.isActive else { return }
         let id = UUID()
         let isImage = filename.lowercased().hasSuffix(".jpg")
             || filename.lowercased().hasSuffix(".jpeg")
@@ -1756,6 +1906,18 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// UI 入口统一走这个(searchDebounceTask 触发), 不直接裸调 searchServer() —— 内部把 Task 句柄
+    /// 存进 searchServerTask, stopAndWait() 才能真等到它退出.
+    func searchServerTracked() async {
+        searchServerTask?.cancel()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.searchServer()
+        }
+        searchServerTask = task
+        await task.value
+    }
+
     func searchServer() async {
         // 2026-05-07 Phase 2: local-first search 走 ChatStore SwiftData / 本地空 + backfill 未完成 fallback server
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1777,11 +1939,18 @@ final class ChatViewModel: ObservableObject {
         case .link: typeFilter = nil; linkOnly = true
         }
 
-        let local = await chatStore.search(keyword: q, attachmentTypeFilter: typeFilter, linkOnly: linkOnly, limit: 500)
+        // 二审(P0-1): 入口冻结 scope + 记住当时的 mode, 跟 jumpToMessage/loadEarlier 同款 —— 本地优先
+        // 读(还没有先导 await, 此刻取值等于 ambient 现算)跟网络 fallback 之后的 upsert 全程沿用同一份
+        // entryMode, 不会出现"本地读的是 A 模式, 网络回来写的是 ambient 现算的 B 模式"这种撕裂.
+        let entryMode = DirectAPIConfig.mode
+        let store = chatStore.snapshot(entryMode)
+        let local = await store.search(keyword: q, attachmentTypeFilter: typeFilter, linkOnly: linkOnly, limit: 500)
         if !local.isEmpty {
             self.serverSearchResults = local.sorted(by: Self.chatMessageDescending)
             return
         }
+        // P0 直连(code review P0-2): directAPI 本地搜索空就是真空(没有 server 兜底数据源可拉), 不 fallback.
+        guard entryMode == .ccServer else { return }
         // 本地空永远 fallback server (backfillComplete 标记不可靠 历史 hotfix 加 cap 把数据删过)
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/search")
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
@@ -1795,7 +1964,7 @@ final class ChatViewModel: ObservableObject {
             let decoded = try JSONDecoder().decode(ChatHistoryResponse.self, from: data)
             self.serverSearchResults = decoded.records
             // 顺手缓存到本地
-            await chatStore.upsertAsync(decoded.records)
+            await store.upsertAsync(decoded.records)
         } catch {
             self.lastError = "搜索失败: \(error.localizedDescription)"
         }
@@ -1804,20 +1973,25 @@ final class ChatViewModel: ObservableObject {
     /// 2026-05-07 Phase 2: 后台分页 backfill 历史进 SwiftData. 不阻塞首屏.
     /// hotfix 限 5000 条最近 (不再全量 13322 防 SwiftData 表过大卡 search)
     func backfillHistory() async {
+        // code review P0-1: backfill 跨越 50 页 x 网络请求 x sleep, 全程只用这一份冻结的 ccServer scope —
+        // 不读 ambient chatStore(它按当前全局模式实时路由, 网络等待期间用户切模式会让响应写进错的库).
+        // backfillHistory 架构上只在 ccServer 模式跑(directAPI 早退于 start()), 硬编码 .ccServer 正确.
+        let store = chatStore.snapshot(.ccServer)
         // 2026-05-09 用户 push 本地 < 100 条强制重跑 (用户删本地后 flag 还残留 backfill 不会自启)
-        let localCount = chatStore.count()
+        let localCount = store.count()
         if localCount < 100 {
             UserDefaults.standard.set(false, forKey: "backfillComplete_v2")
         }
         if UserDefaults.standard.bool(forKey: "backfillComplete_v2") {
             return  // 已完成跳过
         }
-        var totalFetched = chatStore.count()
-        var oldestTs: String? = chatStore.oldestTs()
+        var totalFetched = store.count()
+        var oldestTs: String? = store.oldestTs()
         var emptyHits = 0
         // build 194 — 进度浮窗
         self.backfillProgress = .running(synced: totalFetched)
         for _ in 0..<50 {  // 50 页 x 1000/页 = 50000 条上限 覆盖全量 13322
+            guard !Task.isCancelled else { return }  // 模式切换触发的 stopAndWait() 会取消这个 task
             guard let oldest = oldestTs else { break }
             let url = CcServerConfig.serverURL.appendingPathComponent("chat/history")
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
@@ -1828,6 +2002,7 @@ final class ChatViewModel: ObservableObject {
             guard let finalURL = components?.url else { break }
             do {
                 let (data, _) = try await session.data(for: CcServerConfig.authenticatedRequest(url: finalURL))
+                guard !Task.isCancelled else { return }  // 网络返回后、写库前再查一次: 等待期间可能已被取消
                 let resp = try JSONDecoder().decode(ChatHistoryResponse.self, from: data)
                 if resp.records.isEmpty {
                     emptyHits += 1
@@ -1835,7 +2010,7 @@ final class ChatViewModel: ObservableObject {
                     continue
                 }
                 emptyHits = 0
-                await chatStore.upsertAsync(resp.records)
+                await store.upsertAsync(resp.records)
                 totalFetched += resp.records.count
                 oldestTs = resp.records.first?.ts  // server 返按 ts asc
                 UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastBackfillAt")
@@ -1862,12 +2037,27 @@ final class ChatViewModel: ObservableObject {
     }
 
     /// 2026-05-07 Phase 3: 按日期跳到那天第一条消息
+    /// UI 入口统一走这个, 不直接裸调 jumpToDate() —— 内部把 Task 句柄存进 jumpToDateTask,
+    /// stopAndWait() 才能真等到它退出.
+    func jumpToDateTracked(_ day: String) async {
+        jumpToDateTask?.cancel()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.jumpToDate(day)
+        }
+        jumpToDateTask = task
+        await task.value
+    }
+
     func jumpToDate(_ day: String) async {
         let dayMsgs = chatStore.dateRange(day: day)
         if let first = dayMsgs.first {
             await jumpToMessage(first)
             return
         }
+        // 二审(P0-2 同类漏网路径): 本地没那天时之前会无条件拉 ccServer /chat/history(自建 session)——
+        // directAPI 没有"按日期查 server"这个能力, 到此为止(jumpToMessage 内部也会按 entryMode 再挡一道).
+        guard !DirectAPIConfig.isActive else { return }
         // 本地没那天 拉 server
         let url = CcServerConfig.serverURL.appendingPathComponent("chat/history")
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
@@ -1897,12 +2087,31 @@ final class ChatViewModel: ObservableObject {
 
     /// 2026-05-07 用户 push 跳原文 Phase 1: ChatStore.around 优先 本地 miss fallback server /chat/history?around_ts=
     @Published var jumpScrollTarget: String? = nil
+    /// UI 入口统一走这个(点击引用/搜索结果/推送跳原文等), 不直接裸调 jumpToMessage() —— 内部把 Task
+    /// 句柄存进 jumpToMessageTask, stopAndWait() 才能真等到它退出.
+    func jumpToMessageTracked(_ targetMsg: ChatMessage) async {
+        jumpToMessageTask?.cancel()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.jumpToMessage(targetMsg)
+        }
+        jumpToMessageTask = task
+        await task.value
+    }
+
     func jumpToMessage(_ targetMsg: ChatMessage) async {
         let ts = targetMsg.ts
+        // 二审(P0-1): 入口冻结 scope + 记住当时的 mode —— around() 是本函数第一条语句(尚未 await),
+        // ambient 读此刻的模式是安全的; 但后面的网络 fallback + upsert 跨了 await, 必须沿用这里冻结
+        // 的身份, 不能等网络回来后重新读 ambient(那时全局模式可能已经变了).
+        let entryMode = DirectAPIConfig.mode
+        let store = chatStore.snapshot(entryMode)
         // 先查本地 cache
-        var aroundMsgs: [ChatMessage] = chatStore.around(ts: ts, before: 25, after: 25)
-        // 本地不足 拉 server
-        if aroundMsgs.count < 10 {
+        var aroundMsgs: [ChatMessage] = store.around(ts: ts, before: 25, after: 25)
+        // 二审(P0-2 漏网路径): 本地不足时之前会无条件拉 ccServer /chat/history(用的正是
+        // ChatViewModel.session 这枚自建 session)—— directAPI 没有 server 可 fallback, 只有 ccServer
+        // 才尝试网络补(网络层 guard 本该也拦得住, 这里是功能层入口再挡一道).
+        if aroundMsgs.count < 10 && entryMode == .ccServer {
             let url = CcServerConfig.serverURL.appendingPathComponent("chat/history")
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
             components?.queryItems = [
@@ -1914,7 +2123,7 @@ final class ChatViewModel: ObservableObject {
                     let (data, _) = try await session.data(for: CcServerConfig.authenticatedRequest(url: finalURL))
                     let decoded = try JSONDecoder().decode(ChatHistoryResponse.self, from: data)
                     aroundMsgs = decoded.records
-                    chatStore.upsert(decoded.records)
+                    store.upsert(decoded.records)
                 } catch {
                     // ignore 用本地有什么算什么
                 }
@@ -2277,6 +2486,19 @@ final class ChatViewModel: ObservableObject {
         let sourceText = rawText ?? draft
         let text = sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+
+        // P0 直连: 完全独立发送路径, 不碰下面 ccServer 的 optimistic-send/quote/slash 逻辑.
+        if DirectAPIConfig.isActive {
+            if rawText == nil { draft = "" }
+            // 存句柄而不是直接 await —— stop()/handleModeChange() 才能真取消这个流(code review P0-1).
+            // 先取消上一条还没完的流(防用户快速连发导致两条流交错写context/落库).
+            directAPISendTask?.cancel()
+            directAPISendTask = Task { [weak self] in
+                await self?.sendDirectAPI(text: text)
+            }
+            return
+        }
+
         // 2026-05-14 slash routing re-enabled (build 188).
         // 之前怀疑 Phase B routing 触发了 SwiftUI List scroll race, build 183 临时撤掉.
         // build 184 通过把 List 换成 LazyVStack 彻底拔了 race 的根, 不再受 routing 影响.
@@ -2323,12 +2545,139 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    // MARK: - P0 直连 (directAPI): 不经 server, 本地历史 + 直连 provider SSE.
+
+    /// directAPI 发送: 本地 optimistic user 消息立即落 chatStore(此刻路由到 ChatCacheDirectAPI.db, 与
+    /// ccServer 缓存物理隔离) + 本地 assistant 占位, provider SSE 增量原地更新同一条 assistant 消息
+    /// (节流 ~10Hz 避免每个 token 都触发全量 rebuildDisplayedRowsCache). 无 server 回包这一步 — 本地记录
+    /// 本身就是终态, 结束/出错都直接落库, 不进 sendingIds/failedIds/pendingFailedMessages 那套 ccServer 专用重试队列.
+    private func sendDirectAPI(text: String) async {
+        // code review P0-1: SSE 流全程只用这一份冻结的 directAPI scope, 不读 ambient chatStore(流在途时
+        // 用户切回 ccServer, 结束后如果重新读全局模式, assistant 会被写进 ccServer 的库).
+        let store = chatStore.snapshot(.directAPI)
+        guard !Task.isCancelled else { return }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        let userMsg = ChatMessage(
+            ts: formatter.string(from: Date()), role: "user", text: text, source: "ios-app",
+            quotedTs: nil, quotedText: nil, quotedRole: nil,
+            attachmentUrl: nil, attachmentType: nil, attachmentFilename: nil,
+            reactions: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+            location: nil, metadata: nil, localId: "local-\(UUID().uuidString)"
+        )
+        appendUniqueLocalOnly(userMsg)
+        store.upsert([userMsg])
+
+        sending = true
+        defer { sending = false }
+
+        // 上下文窗口: 最近 30 条(含刚发的这条), 防 token 爆炸, 不做摘要压缩(P1).
+        let historyMsgs = store.latest(limit: 30).filter { $0.role == "user" || $0.role == "assistant" }
+        let apiMessages = historyMsgs.map { DirectAPIMessage(role: $0.role, content: $0.text) }
+        let system = DirectAPIConfig.composeSystemPrompt()
+
+        // P0-4: DirectAPIClient(DirectAPICore package)不认识 app 的 DirectAPIConfig, 显式传参保持
+        // 包纯逻辑可移植——key 缺失/为空在这里挡(插占位气泡前挡, 不会闪一下又消失).
+        guard let apiKey = DirectAPIConfig.apiKey, !apiKey.isEmpty else {
+            lastError = "没有配置 API key, 去设置页填一个"
+            return
+        }
+
+        let assistantId = "local-\(UUID().uuidString)"
+        let assistantTs = formatter.string(from: Date())
+        appendUniqueLocalOnly(ChatMessage(
+            ts: assistantTs, role: "assistant", text: "", source: "direct-api",
+            quotedTs: nil, quotedText: nil, quotedRole: nil,
+            attachmentUrl: nil, attachmentType: nil, attachmentFilename: nil,
+            reactions: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+            location: nil, metadata: nil, localId: assistantId
+        ))
+
+        var buffer = ""
+        var lastFlush = Date.distantPast
+        do {
+            for try await delta in DirectAPIClient.streamChat(
+                messages: apiMessages, system: system,
+                provider: DirectAPIConfig.provider, baseURL: DirectAPIConfig.baseURL,
+                model: DirectAPIConfig.model, apiKey: apiKey
+            ) {
+                buffer += delta
+                if Date().timeIntervalSince(lastFlush) > 0.1 {
+                    updateLocalMessageText(id: assistantId, ts: assistantTs, text: buffer)
+                    lastFlush = Date()
+                }
+            }
+            guard !Task.isCancelled else { return }  // 流刚好在最后一帧后被取消: 不落库不报错(被打断不算失败)
+            updateLocalMessageText(id: assistantId, ts: assistantTs, text: buffer)
+            if buffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                removeLocalMessage(id: assistantId)
+                lastError = "没收到回复内容"
+            } else {
+                store.upsert([ChatMessage(
+                    ts: assistantTs, role: "assistant", text: buffer, source: "direct-api",
+                    quotedTs: nil, quotedText: nil, quotedRole: nil,
+                    attachmentUrl: nil, attachmentType: nil, attachmentFilename: nil,
+                    reactions: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+                    location: nil, metadata: nil, localId: assistantId
+                )])
+                recordNetworkSuccess()
+                lastError = nil
+            }
+        } catch is CancellationError {
+            // 模式切换/用户中断触发的取消: 不落库、不报错. UI 态留给 handleModeChange() 的 messages=[] 清掉.
+            return
+        } catch {
+            guard !Task.isCancelled else { return }  // 网络层把取消包成了别的 Error 类型, 仍按取消处理不落库
+            updateLocalMessageText(id: assistantId, ts: assistantTs, text: buffer)
+            if buffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                removeLocalMessage(id: assistantId)
+            } else {
+                store.upsert([ChatMessage(
+                    ts: assistantTs, role: "assistant", text: buffer, source: "direct-api",
+                    quotedTs: nil, quotedText: nil, quotedRole: nil,
+                    attachmentUrl: nil, attachmentType: nil, attachmentFilename: nil,
+                    reactions: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+                    location: nil, metadata: nil, localId: assistantId
+                )])
+            }
+            lastError = (error as? DirectAPIError)?.errorDescription ?? DirectAPIError.network(error.localizedDescription).errorDescription
+        }
+    }
+
+    /// directAPI 专用 append: 跳过 appendUnique 那套"localId!=nil 就不落库, 等 server 回包替换"逻辑
+    /// (directAPI 没有 server 回包这一步, 本地记录自己就是终态, 落库由调用方显式控制时机).
+    private func appendUniqueLocalOnly(_ rec: ChatMessage) {
+        if !self.messages.contains(where: { $0.id == rec.id }) {
+            self.messages.append(rec)
+            _sortMessages()
+        }
+    }
+
+    /// SSE 增量到达原地更新同一条 assistant 消息文本(id/ts 不变, 触发 messages.didSet 的 rebuild 分支).
+    private func updateLocalMessageText(id: String, ts: String, text: String) {
+        guard let idx = self.messages.firstIndex(where: { $0.id == id }) else { return }
+        self.messages[idx] = ChatMessage(
+            ts: ts, role: "assistant", text: text, source: "direct-api",
+            quotedTs: nil, quotedText: nil, quotedRole: nil,
+            attachmentUrl: nil, attachmentType: nil, attachmentFilename: nil,
+            reactions: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+            location: nil, metadata: nil, localId: id
+        )
+    }
+
+    private func removeLocalMessage(id: String) {
+        self.messages.removeAll { $0.id == id }
+    }
+
     // MARK: - 拍一拍 (v2.6, 仅微信主题)
 
     /// 双击对方头像触发: 插一条本地居中灰字系统消息「我拍了拍 "<AI名>"<后缀>」+ 复用现有 /chat/send 发 ping 给对方.
     /// 多选态不触发 (那时双击头像是 toggle 选中). 仅微信主题 (调用源 WeChatBubbleRow 本就 wechat-only, 这里再 guard 一道).
     func triggerPatPat() {
-        guard !multiSelectMode, ThemeStore.shared.theme == .wechat else { return }
+        // P0 直连: 拍一拍 ping 走 /chat/send, directAPI 模式下 gate 掉(宁可少不可崩).
+        guard !multiSelectMode, ThemeStore.shared.theme == .wechat, !DirectAPIConfig.isActive else { return }
         let aiName = CcNameResolver.name(for: .ai)
         let suffix = UserDefaults.standard.string(forKey: "patpat_suffix") ?? ""
         let text = "我拍了拍 \"\(aiName)\"\(suffix)"
@@ -2820,6 +3169,10 @@ final class ChatViewModel: ObservableObject {
     /// downgrades any leftover `.sending` records to `.failed` (we never trust
     /// "still sending" across process death).
     func restorePendingFailedMessages() {
+        // code review P0-1: 这个队列是 ccServer optimistic-send 专用(UserDefaults 全局键, 不分模式),
+        // directAPI 冷启动如果不 gate, 旧 ccServer 失败气泡会直接混进 directAPI 历史 UI, 还带出重试行为
+        // (重试会打 /chat/send —— directAPI 模式下这个端点根本没有意义).
+        guard !DirectAPIConfig.isActive else { return }
         guard let data = UserDefaults.standard.data(forKey: Self.kPendingFailedKey),
               let list = try? JSONDecoder().decode([ChatMessage].self, from: data),
               !list.isEmpty else { return }
@@ -2859,6 +3212,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     func clearUnread() async {
+        guard !DirectAPIConfig.isActive else { return }  // code review P0-2: onAppear/前台恢复无条件调这个
         let url = CcServerConfig.serverURL.appendingPathComponent("push/clear-unread")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -2933,6 +3287,8 @@ struct ChatView: View {
     var scrollToken: Int = 0
     // v2.8 R3a: 长按微信顶栏昵称进终端 tab. selectedTab 是 ContentView 的 @State, 经此闭包透传上去 (ContentView 传 { selectedTab = 1 }).
     var onEnterTerminal: () -> Void = {}
+    // P0 直连: 顶栏「直连」pill 点击进设置页. 同款透传, ContentView 传 { selectedTab = 2 }.
+    var onShowSettings: () -> Void = {}
 
     private func statusColor(for status: ChatConnectionStatus) -> Color {
         switch status {
@@ -3075,7 +3431,7 @@ struct ChatView: View {
                 quoteDisplayText: resolvedWechatQuoteText(for: msg, in: vm.messages),
                 onQuoteTap: {
                     if let qts = msg.quotedTs, let target = vm.messages.first(where: { $0.ts == qts }) {
-                        Task { await vm.jumpToMessage(target) }
+                        Task { await vm.jumpToMessageTracked(target) }
                     }
                 }
             )
@@ -3094,7 +3450,8 @@ struct ChatView: View {
                     onExit: { ThemeStore.shared.theme = .warm },
                     onEnterTerminal: onEnterTerminal,   // v2.8 R3a: 透传 ContentView 的 { selectedTab = 1 }, 不再切 theme
                     onToggleSearch: { showSearch.toggle() },
-                    onShowFavorites: onShowFavorites,
+                    // P0 直连(code review P0-2): 同款 gate, 微信主题下也不例外(呼应"漏平行主题变体"教训).
+                    onShowFavorites: DirectAPIConfig.isActive ? nil : onShowFavorites,
                     onClearChat: { showClearChatConfirm = true },
                     multiSelectMode: vm.multiSelectMode,
                     selectedCount: vm.selectedTs.count,
@@ -3117,6 +3474,18 @@ struct ChatView: View {
                         aiAvatarPath: aiAvatarPath,
                         onCancel: { vm.exitMultiSelect() }
                     )
+                    // P0 直连: directAPI 模式下亮一个「直连」pill, 点击进设置页(APIdirect section).
+                    if DirectAPIConfig.isActive {
+                        Button(action: onShowSettings) {
+                            Text("直连")
+                                .font(.ccSerifAdaptive(size: 11, weight: .semibold))
+                                .foregroundStyle(Color.ccAccent)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(Color.ccAccent.opacity(0.12))
+                                .clipShape(Capsule())
+                        }
+                    }
                     Spacer()
                     if vm.multiSelectMode {
                         Text("已选 \(vm.selectedTs.count) 条")
@@ -3132,7 +3501,8 @@ struct ChatView: View {
                         onToggleSearch: { showSearch.toggle() },
                         onEnterRP: {
                         },
-                        onShowFavorites: onShowFavorites,
+                        // P0 直连(code review P0-2): 收藏夹打 /favorites/list, directAPI 没有本地实现, gate 掉.
+                        onShowFavorites: DirectAPIConfig.isActive ? nil : onShowFavorites,
                         onClearChat: { showClearChatConfirm = true }
                     )
                 }
@@ -3215,8 +3585,9 @@ struct ChatView: View {
                         showShareSheet = true
                         vm.exitMultiSelect()
                     },
-                    onFavorite: { Task { await vm.addSelectedToFavorites() } },
-                    onDelete: { showDeleteSelectedConfirm = true },
+                    // P0 直连(code review P0-2): 多选收藏/删除都打 server 端点, directAPI 模式下不可触发.
+                    onFavorite: { if !DirectAPIConfig.isActive { Task { await vm.addSelectedToFavorites() } } },
+                    onDelete: { if !DirectAPIConfig.isActive { showDeleteSelectedConfirm = true } },
                     onCancel: { vm.exitMultiSelect() }
                 )
                 .padding(10)
@@ -3359,7 +3730,7 @@ struct ChatView: View {
                 f.dateFormat = "yyyy-MM-dd"
                 f.timeZone = TimeZone(identifier: "UTC")
                 let day = f.string(from: picked)
-                Task { await vm.jumpToDate(day) }
+                Task { await vm.jumpToDateTracked(day) }
             }
         }
         #if os(iOS)
@@ -3441,7 +3812,7 @@ struct ChatView: View {
             searchDebounceTask = Task {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 if Task.isCancelled { return }
-                await vm.searchServer()
+                await vm.searchServerTracked()
             }
         }
         .onChange(of: showSearch) { _, isShown in
@@ -3701,19 +4072,22 @@ private struct ChatInputBar: View {
 
     private var wechatInputBar: some View {
         HStack(spacing: 8) {
-            Button {
-                if !speech.isRecording {
-                    speechPrefix = draftLocal.isEmpty ? "" : draftLocal + " "
+            // P0 直连: 输入框纯文本, 语音/表情包/相机/图片/文件全 gate(一切打 server 端点的功能).
+            if !DirectAPIConfig.isActive {
+                Button {
+                    if !speech.isRecording {
+                        speechPrefix = draftLocal.isEmpty ? "" : draftLocal + " "
+                    }
+                    Task { await speech.toggle() }
+                } label: {
+                    Image(systemName: speech.isRecording ? "mic.fill" : "mic")
+                        .font(.system(size: 22, weight: .medium))
+                        .foregroundStyle(speech.isRecording ? Color.red : Color(red: 0.35, green: 0.35, blue: 0.35))
                 }
-                Task { await speech.toggle() }
-            } label: {
-                Image(systemName: speech.isRecording ? "mic.fill" : "mic")
-                    .font(.system(size: 22, weight: .medium))
-                    .foregroundStyle(speech.isRecording ? Color.red : Color(red: 0.35, green: 0.35, blue: 0.35))
-            }
-            .onChange(of: speech.transcript) { _, newValue in
-                guard !newValue.isEmpty else { return }
-                draftLocal = speechPrefix + newValue
+                .onChange(of: speech.transcript) { _, newValue in
+                    guard !newValue.isEmpty else { return }
+                    draftLocal = speechPrefix + newValue
+                }
             }
             TextField("", text: $draftLocal, axis: .vertical)
                 .lineLimit(1...5)
@@ -3733,59 +4107,64 @@ private struct ChatInputBar: View {
                         commitFromSubmit()
                     }
                 }
-            Button { showStickerPanel = true } label: {
-                Image(systemName: "face.smiling")
-                    .font(.system(size: 22, weight: .medium))
-                    .foregroundStyle(Color(red: 0.35, green: 0.35, blue: 0.35))
+            if !DirectAPIConfig.isActive {
+                Button { showStickerPanel = true } label: {
+                    Image(systemName: "face.smiling")
+                        .font(.system(size: 22, weight: .medium))
+                        .foregroundStyle(Color(red: 0.35, green: 0.35, blue: 0.35))
+                }
+                Menu {
+                    Button { syncToVM(); onCamera() } label: { Label("拍照", systemImage: "camera") }
+                    Button { syncToVM(); onImage() } label: { Label("照片", systemImage: "photo") }
+                    Button { syncToVM(); onFile() } label: { Label("文件", systemImage: "doc") }
+                } label: {
+                    Image(systemName: "plus.circle")
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(Color(red: 0.35, green: 0.35, blue: 0.35))
+                }
+                .disabled(vm.sending)
             }
-            Menu {
-                Button { syncToVM(); onCamera() } label: { Label("拍照", systemImage: "camera") }
-                Button { syncToVM(); onImage() } label: { Label("照片", systemImage: "photo") }
-                Button { syncToVM(); onFile() } label: { Label("文件", systemImage: "doc") }
-            } label: {
-                Image(systemName: "plus.circle")
-                    .font(.system(size: 24, weight: .medium))
-                    .foregroundStyle(Color(red: 0.35, green: 0.35, blue: 0.35))
-            }
-            .disabled(vm.sending)
         }
     }
 
     private var standardInputBar: some View {
         HStack(spacing: 8) {
-            Menu {
+            // P0 直连: 输入框纯文本, 相机/图片/文件/表情包全 gate(一切打 server 端点的功能).
+            if !DirectAPIConfig.isActive {
+                Menu {
+                    Button {
+                        syncToVM()
+                        onCamera()
+                    } label: { Label("拍照", systemImage: "camera") }
+                    Button {
+                        syncToVM()
+                        onFile()
+                    } label: { Label("文件", systemImage: "doc") }
+                } label: {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.ccSerifAdaptive(size: 28, weight: .bold))
+                        .foregroundStyle(Color.ccTextDim)
+                }
+                .disabled(vm.sending)
+
                 Button {
                     syncToVM()
-                    onCamera()
-                } label: { Label("拍照", systemImage: "camera") }
-                Button {
-                    syncToVM()
-                    onFile()
-                } label: { Label("文件", systemImage: "doc") }
-            } label: {
-                Image(systemName: "plus.circle.fill")
-                    .font(.ccSerifAdaptive(size: 28, weight: .bold))
-                    .foregroundStyle(Color.ccTextDim)
-            }
-            .disabled(vm.sending)
+                    onImage()
+                } label: {
+                    Image(systemName: "photo.fill")
+                        .font(.ccSerifAdaptive(size: 20, weight: .semibold))
+                        .foregroundStyle(Color.ccTextDim)
+                }
+                .disabled(vm.sending)
 
-            Button {
-                syncToVM()
-                onImage()
-            } label: {
-                Image(systemName: "photo.fill")
-                    .font(.ccSerifAdaptive(size: 20, weight: .semibold))
-                    .foregroundStyle(Color.ccTextDim)
+                // v2.7 B: 表情包入口 (所有主题都带). 弹 StickerPickerSheet 发/传表情包.
+                Button { showStickerPanel = true } label: {
+                    Image(systemName: "face.smiling")
+                        .font(.ccSerifAdaptive(size: 20, weight: .semibold))
+                        .foregroundStyle(Color.ccTextDim)
+                }
+                .disabled(vm.sending)
             }
-            .disabled(vm.sending)
-
-            // v2.7 B: 表情包入口 (所有主题都带). 弹 StickerPickerSheet 发/传表情包.
-            Button { showStickerPanel = true } label: {
-                Image(systemName: "face.smiling")
-                    .font(.ccSerifAdaptive(size: 20, weight: .semibold))
-                    .foregroundStyle(Color.ccTextDim)
-            }
-            .disabled(vm.sending)
 
             ZStack(alignment: .trailing) {
                 TextField(storedPlaceholder, text: $draftLocal, axis: .vertical)
@@ -3820,7 +4199,9 @@ private struct ChatInputBar: View {
                     }
                     .padding(.trailing, 40)
 
-                if delayedIsWorking {
+                // P0 直连: abortChain 打 server 端点(停 Claude Code chain), directAPI 没有这条管道 gate 掉;
+                // 语音同样 gate(输入框纯文本). 流式响应中途不可取消是已知 P0 边界, 见 result 文档 P1 遗留.
+                if delayedIsWorking && !DirectAPIConfig.isActive {
                     Button {
                         Task { await vm.abortChain() }
                     } label: {
@@ -3829,7 +4210,7 @@ private struct ChatInputBar: View {
                             .foregroundStyle(Color(red: 0.866, green: 0.314, blue: 0.314).opacity(0.85))
                             .padding(.trailing, 10)
                     }
-                } else if !inputFocused.wrappedValue {
+                } else if !DirectAPIConfig.isActive, !inputFocused.wrappedValue {
                     Button {
                         if !speech.isRecording {
                             speechPrefix = draftLocal.isEmpty ? "" : draftLocal + " "
@@ -4528,7 +4909,7 @@ private struct ChatListView: View {
                         let anchor = vm.displayedRowsCache.first?.id
                         isUserScrolledUp = true
                         suppressBottomScrollUntil = Date().addingTimeInterval(2.0)
-                        await vm.loadEarlier()
+                        await vm.loadEarlierTracked()
                         if let anchor {
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                                 proxy.scrollTo(anchor, anchor: .top)
@@ -4726,7 +5107,8 @@ private struct ChatListView: View {
                 // Phase 2/3 (thinking-stream-render) + 2026-06-11 占位动画: 该 turn 第一条 assistant 消息上方,
                 // thinking 已拉到 → 折叠卡片; 还在路上 → 「正在思考」占位 (原地, 拉到内容卡片替占位不跳).
                 // 微信伪装主题: thinking 卡片/占位(含亲笔旁白)全隐, 只留纯文字流.
-                if ThemeStore.shared.theme != .wechat,
+                // P0 直连: thinking 走 server /v1/thinking, directAPI 模式下不存在这条管道, 全隐.
+                if ThemeStore.shared.theme != .wechat, !DirectAPIConfig.isActive,
                    vm.isThinkingChipAnchor(msg), let tid = msg.turnId {
                     if let think = vm.thinkingByTurn[tid] {
                         ThinkingChip(text: think)
@@ -4772,7 +5154,7 @@ private struct ChatListView: View {
                 quoteDisplayText: resolvedWechatQuoteText(for: msg, in: vm.messages),
                 onQuoteTap: {
                     if let qts = msg.quotedTs, let target = vm.messages.first(where: { $0.ts == qts }) {
-                        Task { await vm.jumpToMessage(target) }
+                        Task { await vm.jumpToMessageTracked(target) }
                     }
                 },
                 sendStatus: vm.sendStatus(forId: msg.id),
@@ -5620,8 +6002,11 @@ private struct ChatMessageListRow: View {
             Button(action: onEnterMultiSelect) {
                 Label("选择多条", systemImage: "checkmark.circle")
             }
-            Button(action: onQuote) {
-                Label("引用回复", systemImage: "quote.bubble")
+            // P0 直连: 引用回复的 quoted_ts 语义绑在 ccServer 的 /chat/send payload 上, directAPI gate 掉.
+            if !DirectAPIConfig.isActive {
+                Button(action: onQuote) {
+                    Label("引用回复", systemImage: "quote.bubble")
+                }
             }
             if !message.isUser {
                 Button(action: { UIPasteboard.general.string = message.text }) {
@@ -5630,16 +6015,21 @@ private struct ChatMessageListRow: View {
             }
             // 2026-05-14 build 198 — 翻译选项删 (build 190 加进来 用户 6:33 推删 用不上)
             // build 129 — 复制整段 已外挂到 bubble 下面 这里 contextMenu 不再重复
-            if !message.isUser, let fn = onRegenerate {
-                Button(action: fn) {
-                    Label("重新说", systemImage: "arrow.clockwise")
+            // P0 直连(code review P0-2): 重新说/收藏/添加待办/删除 都打 server 端点(/chat/regenerate,
+            // /favorites/add, chain 消息, /chat/delete) —— directAPI 没有对应后端, 全部 gate 掉.
+            // directAPI 本地单条删除是已知 P1 缺口(见 result 文档), 不是"删了会崩", 是"还没做".
+            if !DirectAPIConfig.isActive {
+                if !message.isUser, let fn = onRegenerate {
+                    Button(action: fn) {
+                        Label("重新说", systemImage: "arrow.clockwise")
+                    }
                 }
-            }
-            Button(action: onFavorite) {
-                Label("收藏本条", systemImage: "bookmark")
-            }
-            Button(action: onAddTodo) {
-                Label("添加到待办", systemImage: "checklist.checked")
+                Button(action: onFavorite) {
+                    Label("收藏本条", systemImage: "bookmark")
+                }
+                Button(action: onAddTodo) {
+                    Label("添加到待办", systemImage: "checklist.checked")
+                }
             }
             if let enterRP = onEnterRP {
                 Button(action: enterRP) {
@@ -5654,8 +6044,10 @@ private struct ChatMessageListRow: View {
                     Label(message.attachmentType == "image" ? "保存图片 / 分享" : "保存 / 分享", systemImage: "square.and.arrow.down")
                 }
             }
-            Button(role: .destructive, action: onDelete) {
-                Label("删除", systemImage: "trash")
+            if !DirectAPIConfig.isActive {
+                Button(role: .destructive, action: onDelete) {
+                    Label("删除", systemImage: "trash")
+                }
             }
         }
     }
@@ -7630,7 +8022,7 @@ struct SearchStateContent: View {
                 SearchResultRow(message: msg, keyword: vm.searchText)
                     .padding(.vertical, 6)
                     .padding(.horizontal, 12)
-                    .onTapGesture { Task { await vm.jumpToMessage(msg) } }
+                    .onTapGesture { Task { await vm.jumpToMessageTracked(msg) } }
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets())
@@ -7643,7 +8035,7 @@ struct SearchStateContent: View {
                     ImageGridSection(
                         messages: msgs,
                         onTapImage: { url in onImageTap?(url) },
-                        onJumpToMessage: { msg in Task { await vm.jumpToMessage(msg) } }
+                        onJumpToMessage: { msg in Task { await vm.jumpToMessageTracked(msg) } }
                     )
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
@@ -7658,7 +8050,7 @@ struct SearchStateContent: View {
                         FileResultRow(message: msg)
                             .padding(.vertical, 6)
                             .padding(.horizontal, 12)
-                            .onTapGesture { Task { await vm.jumpToMessage(msg) } }
+                            .onTapGesture { Task { await vm.jumpToMessageTracked(msg) } }
                             .listRowBackground(Color.clear)
                             .listRowSeparator(.hidden)
                             .listRowInsets(EdgeInsets())
@@ -7673,7 +8065,7 @@ struct SearchStateContent: View {
                         LinkResultRow(message: msg)
                             .padding(.vertical, 6)
                             .padding(.horizontal, 12)
-                            .onTapGesture { Task { await vm.jumpToMessage(msg) } }
+                            .onTapGesture { Task { await vm.jumpToMessageTracked(msg) } }
                             .listRowBackground(Color.clear)
                             .listRowSeparator(.hidden)
                             .listRowInsets(EdgeInsets())
@@ -7688,7 +8080,7 @@ struct SearchStateContent: View {
                         AudioResultRow(message: msg)
                             .padding(.vertical, 6)
                             .padding(.horizontal, 12)
-                            .onTapGesture { Task { await vm.jumpToMessage(msg) } }
+                            .onTapGesture { Task { await vm.jumpToMessageTracked(msg) } }
                             .listRowBackground(Color.clear)
                             .listRowSeparator(.hidden)
                             .listRowInsets(EdgeInsets())

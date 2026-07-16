@@ -12,6 +12,8 @@ import UIKit
 struct WizardStepAIIdentity: View {
     @Binding var aiAvatarDraft: String        // legacy emoji storage (Phase A) — Phase C ignored for image path
     @Binding var aiNameDraft: String
+    // P0 直连: 门 B 顺手填 persona, nil = 门 A(不渲染这个 field, body 逐字节不变). 门 B 传真 binding.
+    var personaDraft: Binding<String>? = nil
     let onNext: () -> Void
     let onSkip: () -> Void
 
@@ -80,6 +82,23 @@ struct WizardStepAIIdentity: View {
                         .stroke(aiNameDraft.isEmpty ? Color.clear : Color.ccAccent.opacity(0.5), lineWidth: 1)
                 )
                 .padding(.horizontal, 40)
+
+            if let personaDraft {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("AI 人格 (可选, 跳过用默认)")
+                        .font(.ccSerifAdaptive(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.ccTextDim)
+                    TextEditor(text: personaDraft)
+                        .font(.system(size: 13))
+                        .frame(minHeight: 70)
+                        .scrollContentBackground(.hidden)
+                        .padding(6)
+                        .background(Color.ccCard)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .padding(.horizontal, 28)
+                .padding(.top, 16)
+            }
 
             Spacer()
 
@@ -150,6 +169,10 @@ struct WizardStepAIIdentity: View {
            let filename = AvatarDiskStore.save(img, filename: Self.avatarFilename) {
             UserDefaults.standard.set(filename, forKey: "ai_avatar_path")
             CcNameResolver.notifyChanged()
+        }
+        // P0 直连 门 B: persona 留空 = 用默认模板(DirectAPIConfig.persona getter 已处理空值兜底).
+        if let persona = personaDraft?.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines), !persona.isEmpty {
+            DirectAPIConfig.persona = persona
         }
     }
 }

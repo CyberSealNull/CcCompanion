@@ -1,4 +1,5 @@
 import SwiftUI
+import DirectAPICore
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -18,11 +19,19 @@ struct OnboardingWizard: View {
     @State private var aiNameDraft: String = ""
     @State private var userAvatarDraft: String = ""
     @State private var userNameDraft: String = ""
+    // P0 直连: 门 B persona 草稿(顺手在 AIIdentity 步填), 门 A 路径上这个值从不被读.
+    @State private var directAPIPersonaDraft: String = DirectAPIConfig.persona
+    // P0 直连: 门 A/门 B 分岔标记. 只影响 step 5(AIIdentity) 是否带 personaDraft, 不改 步 0-4/6 任何行为.
+    @State private var viaDirectAPI: Bool = false
 
     // Phase B (2026-05-11) — wizard 流: welcome / Claude setup / serverURL / secret / connection / AI identity / user identity
     // spec 写 totalSteps 6→8 但 step 命名 (step 0=welcome, step 2=serverURL) 暗示替换旧 welcome + 总共 7 步.
     // 为 UX 清爽 (避免两个 welcome 屏) 走 7 步实施, 见 result md 解释.
     private let totalSteps: Int = 7  // 0:welcome 1:claudeSetup 2:server 3:secret 4:connection 5:AI identity 6:user identity
+    // P0 直连: 门 A/门 B 分岔步骤, 用 7 以外的数字避免跟上面 0-6 任何 step 语义冲突/被 stepDots 误画.
+    // step 10 = 选门, step 11 = 门 B provider/key/测试连通. 门 A 选择后落回 step 1, 原 1→6 流程逐字节不变.
+    private static let stepChoosePath = 10
+    private static let stepDirectAPISetup = 11
 
     enum ConnectionStatus { case idle, testing, success, failed }
 
@@ -30,14 +39,37 @@ struct OnboardingWizard: View {
         ZStack {
             Color.ccBg.ignoresSafeArea()
             VStack(spacing: 0) {
-                stepDots
-                    .padding(.top, 24)
-                    .padding(.bottom, 8)
+                // P0 直连: 选门/门 B 设置步不在 0..<totalSteps 范围内(故意, 保门 A 1-6 步号不变), 这两步期间
+                // 隐掉点阵(错位的点阵比没有更误导), 回到门 A/门 B 各自主流程后点阵照常.
+                if step != Self.stepChoosePath && step != Self.stepDirectAPISetup {
+                    stepDots
+                        .padding(.top, 24)
+                        .padding(.bottom, 8)
+                }
 
                 ZStack {
                     if step == 0 {
-                        WizardStepWelcome(onContinue: { withAnimation { step = 1 } })
+                        // P0 直连: Welcome 之后先落选门步(10), 门 A 选择后落回 step 1 原路不变.
+                        WizardStepWelcome(onContinue: { withAnimation { step = Self.stepChoosePath } })
                             .transition(.opacity)
+                    }
+                    if step == Self.stepChoosePath {
+                        WizardStepChoosePath(
+                            onChooseCcServer: { withAnimation { step = 1 } },
+                            onChooseDirectAPI: { withAnimation { step = Self.stepDirectAPISetup } }
+                        )
+                        .transition(.opacity)
+                    }
+                    if step == Self.stepDirectAPISetup {
+                        WizardStepDirectAPISetup(
+                            onNext: { provider, baseURL, model, key in
+                                persistDirectAPISetup(provider: provider, baseURL: baseURL, model: model, key: key)
+                                viaDirectAPI = true
+                                withAnimation { step = 5 }
+                            },
+                            onBack: { withAnimation { step = Self.stepChoosePath } }
+                        )
+                        .transition(.opacity)
                     }
                     if step == 1 {
                         WizardStepClaudeSetup(onContinue: { withAnimation { step = 2 } })
@@ -50,6 +82,7 @@ struct OnboardingWizard: View {
                         WizardStepAIIdentity(
                             aiAvatarDraft: $aiAvatarDraft,
                             aiNameDraft: $aiNameDraft,
+                            personaDraft: viaDirectAPI ? $directAPIPersonaDraft : nil,
                             onNext: { saveAIIdentityIfDirty(); withAnimation { step = 6 } },
                             onSkip: { withAnimation { step = 6 } }
                         )
@@ -385,6 +418,21 @@ struct OnboardingWizard: View {
         }
         onboardingCompleted = true
         dismiss()
+    }
+
+    /// P0 直连 门 B: WizardStepDirectAPISetup 测试连通成功后落盘(跟 completeOnboarding 同一套「点下一步才写」
+    /// 节奏). key 进 Keychain, 其余进 UserDefaults, 最后翻 mode — 翻 mode 放最后一步, 之前任何一步失败/用户
+    /// 返回都不会让 app 半配置地卡进 directAPI 模式.
+    private func persistDirectAPISetup(provider: DirectAPIProvider, baseURL: String, model: String, key: String) {
+        DirectAPIConfig.provider = provider
+        if provider == .openAICompat, !baseURL.isEmpty {
+            DirectAPIConfig.baseURL = baseURL
+        }
+        if !model.isEmpty {
+            DirectAPIConfig.model = model
+        }
+        DirectAPIConfig.setApiKey(key)
+        DirectAPIConfig.mode = .directAPI
     }
 
     /// Persist AI identity drafts to UserDefaults if user typed anything.

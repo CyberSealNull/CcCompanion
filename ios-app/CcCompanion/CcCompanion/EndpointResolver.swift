@@ -98,6 +98,8 @@ final class EndpointResolver: ObservableObject {
     /// If every endpoint is down, leave the previous activeIndex (so user still
     /// sees the same "broken" UX rather than silent NaN).
     func resolveOnce() async {
+        // P0 直连(code review P0-2): 无条件 /health 轮询是"directAPI 不经任何第三方服务器"承诺的漏网之一.
+        guard !DirectAPIConfig.isActive else { return }
         rebuildStatuses()
         let list = CcServerConfig.endpoints
         guard !list.isEmpty else {
@@ -126,6 +128,7 @@ final class EndpointResolver: ObservableObject {
     /// Periodic background sweep — ping all, update status colours, but don't
     /// switch active away from a working server unless it's now down.
     func healthCheckAll() async {
+        guard !DirectAPIConfig.isActive else { return }
         rebuildStatuses()
         let list = CcServerConfig.endpoints
         guard !list.isEmpty else {

@@ -42,6 +42,14 @@ struct CcCompanionApp: App {
         CcServerConfig.syncToAppGroup()
         AvatarDiskStore.migrateStoredAvatarPathsIfNeeded()
         Self.registerCustomFonts()
+        // P0 直连(code review P0-2 二审): 网络层兜底闸, 尽早注册(app 生命周期最前面), 覆盖之后任何时刻
+        // 发出的请求. 拦截 class 本体在 DirectAPICore(见 ServerGuardTests), 这里只装 app 专属状态.
+        DirectAPIServerGuardWiring.install()
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["CCC_UITEST_CHATSTORE_SCOPE_SELFTEST"] == "1" {
+            ChatStoreScopeSelfTest.run()
+        }
+        #endif
         #if os(iOS) && !targetEnvironment(macCatalyst)
         Task { @MainActor in
             PushTokenManager.shared.requestAuthorization()

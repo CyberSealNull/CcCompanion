@@ -8,6 +8,7 @@
 
 import SwiftUI
 import Combine
+import DirectAPICore
 import PhotosUI
 #if canImport(UIKit)
 import UIKit
@@ -280,6 +281,7 @@ final class CcSettingsViewModel: ObservableObject {
     @Published var lastHealthCheck: String = "—"
 
     func refreshAll() async {
+        guard !DirectAPIConfig.isActive else { return }  // code review P0-2: connections/status + health
         loading = true
         defer { loading = false }
         // Phase 设置大砍 (2026-05-11) — 只留 connections + health, 其他统计接口砍掉.
@@ -290,6 +292,7 @@ final class CcSettingsViewModel: ObservableObject {
     }
 
     func checkHealth() async {
+        guard !DirectAPIConfig.isActive else { return }
         let url = CcServerConfig.serverURL.appendingPathComponent("health")
         do {
             let (_, resp) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
@@ -308,6 +311,7 @@ final class CcSettingsViewModel: ObservableObject {
     }
 
     private func fetch(_ path: String, apply: @escaping ([String: Any]) -> Void) async {
+        guard !DirectAPIConfig.isActive else { return }  // 单一收口: refreshAll/loadDebugLog 都过这里
         let url = CcServerConfig.serverURL.appendingPathComponent(path)
         do {
             let (data, _) = try await URLSession.shared.data(for: CcServerConfig.authenticatedRequest(url: url))
@@ -589,6 +593,14 @@ struct CcSettingsView: View {
     @State private var editingEndpoint: EndpointEdit? = nil
     @State private var endpointsTick: Int = 0  // bump to force section re-render after persist
 
+    // P0 直连: DirectAPIConfig 是纯静态存取(非 @Published), 改值后靠这个 tick 强制 section 重算(同 endpointsTick 手法).
+    @State private var directAPITick: Int = 0
+    @State private var directAPIKeyDraft: String = ""  // 只写不回填, 不让 Keychain 里的 key 明文常驻 UI state
+    @State private var directAPIPersonaDraft: String = DirectAPIConfig.persona
+    @State private var directAPITesting: Bool = false
+    @State private var directAPITestResult: Bool? = nil
+    @State private var directAPITestError: String = ""
+
     // Phase E (item 5) — 头像 PHPicker + crop state
     private enum AvatarSlot { case ai, user }
     @State private var avatarPickerSlot: AvatarSlot? = nil
@@ -681,11 +693,17 @@ struct CcSettingsView: View {
 
                 // Group 2 SESSION — 砍 (软清/硬重启搬到终端 tab phase E)
 
-                // Group 3 SERVER (Phase multi-server fallback 2026-05-11 — 多 endpoint + auto fallback)
-                serverEndpointsSection
+                // P0 直连: 模式切换入口, 常驻(两种模式都要能看到 + 切回来).
+                apiDirectSection
 
-                // 订阅用量面板 (ai-usage-monitor 8796) — Claude Code 订阅窗百分比, 公开版 only Claude
-                SubUsageSection()
+                // Group 3 SERVER (Phase multi-server fallback 2026-05-11 — 多 endpoint + auto fallback)
+                // P0 直连: server endpoints / usage 面板都是 ccServer 专属, directAPI 模式下 gate 掉.
+                if !DirectAPIConfig.isActive {
+                    serverEndpointsSection
+
+                    // 订阅用量面板 (ai-usage-monitor 8796) — Claude Code 订阅窗百分比, 公开版 only Claude
+                    SubUsageSection()
+                }
 
                 // Group 4 CONNECTIONS (ccc 不要)
 
@@ -730,26 +748,29 @@ struct CcSettingsView: View {
                 }
 
                 // 终端 session 顺序 (build226) — 拖动自定义终端 tab 的 session 排序
-                section("终端") {
-                    Button {
-                        showSessionOrder = true
-                    } label: {
-                        HStack {
-                            Text("session 顺序")
-                                .font(.ccSerifAdaptive(size: 15))
-                                .foregroundStyle(Color.ccText)
-                            Spacer()
-                            Text("拖动调序")
-                                .font(.system(.callout, design: .monospaced))
-                                .foregroundStyle(Color.ccTextDim)
-                            Image(systemName: "chevron.right")
-                                .font(.ccSerifAdaptive(size: 12))
-                                .foregroundStyle(Color.ccTextDim)
+                // P0 直连: 终端 tab 本身 directAPI 模式下 gate 掉了, 这条配置项跟着隐(orphan 入口宁可不留).
+                if !DirectAPIConfig.isActive {
+                    section("终端") {
+                        Button {
+                            showSessionOrder = true
+                        } label: {
+                            HStack {
+                                Text("session 顺序")
+                                    .font(.ccSerifAdaptive(size: 15))
+                                    .foregroundStyle(Color.ccText)
+                                Spacer()
+                                Text("拖动调序")
+                                    .font(.system(.callout, design: .monospaced))
+                                    .foregroundStyle(Color.ccTextDim)
+                                Image(systemName: "chevron.right")
+                                    .font(.ccSerifAdaptive(size: 12))
+                                    .foregroundStyle(Color.ccTextDim)
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
                         }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
 
                 // Group 7 FEATURES (大砍版)
@@ -780,12 +801,15 @@ struct CcSettingsView: View {
                 }
 
                 // Group 8 STORAGE (Phase E amend — 清缓存按钮砍 留 "重新同步全部历史" 一个)
-                section("STORAGE") {
-                    // 2026-05-09 用户 push 删过本地后从 server 拉全量历史回本地 SwiftData
-                    actionRow(label: "重新同步全部历史 (从 server)", color: .blue) {
-                        UserDefaults.standard.set(false, forKey: "backfillComplete_v2")
-                        NotificationCenter.default.post(name: NSNotification.Name("CcResyncHistory"), object: nil)
-                        actionToast = "已触发 后台分批拉 server 全量 13000+ 条 完成约 30-60 秒"
+                // P0 直连(code review P0-2): 这个按钮触发 server backfill, directAPI 模式下没有意义, gate 掉.
+                if !DirectAPIConfig.isActive {
+                    section("STORAGE") {
+                        // 2026-05-09 用户 push 删过本地后从 server 拉全量历史回本地 SwiftData
+                        actionRow(label: "重新同步全部历史 (从 server)", color: .blue) {
+                            UserDefaults.standard.set(false, forKey: "backfillComplete_v2")
+                            NotificationCenter.default.post(name: NSNotification.Name("CcResyncHistory"), object: nil)
+                            actionToast = "已触发 后台分批拉 server 全量 13000+ 条 完成约 30-60 秒"
+                        }
                     }
                 }
 
@@ -997,6 +1021,10 @@ struct CcSettingsView: View {
 
     @ViewBuilder
     private var groupConfigSection: some View {
+        // P0 直连(code review P0-2): 这整节(含成员增删)常驻显示、不跟 featureGroupView 挂钩, 成员增删打
+        // /group/members/add|delete —— directAPI 模式下没有意义, 整节 gate 掉(呼应 spec 兜底原则, 不
+        // 只挑枚举清单里点名的功能, grep 到的额外面也要处理).
+        if !DirectAPIConfig.isActive {
         section("群聊") {
             // Build 215 S2 — 简化: 名称 + 头像缩略 + "编辑"按钮 一行 → 弹 sheet 同时编辑头像/名称
             groupHeaderRow
@@ -1165,6 +1193,7 @@ struct CcSettingsView: View {
                 Text("确定从群里删除 \(m.title) 吗?")
             }
         }
+        }  // if !DirectAPIConfig.isActive
     }
 
     // Build 215 S2 — 群聊主 row (头像 + 名称 + 编辑入口)
@@ -1649,6 +1678,169 @@ struct CcSettingsView: View {
             }
         }
         .id("endpoints-\(endpointsTick)-\(resolver.activeIndex)")
+    }
+
+    // P0 直连: 主 chat backend 模式切换 + provider 配置 + key + persona. 常驻显示(不 gate 自己),
+    // 是唯一能把用户从 directAPI 切回 ccServer / 反过来的入口.
+    @ViewBuilder
+    private var apiDirectSection: some View {
+        section("API 直连") {
+            Picker("", selection: Binding(
+                get: { DirectAPIConfig.mode },
+                set: { newMode in
+                    DirectAPIConfig.mode = newMode
+                    directAPITestResult = nil
+                    directAPITick &+= 1
+                }
+            )) {
+                Text("Server").tag(ChatBackendMode.ccServer)
+                Text("直连 API").tag(ChatBackendMode.directAPI)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            if DirectAPIConfig.mode == .directAPI {
+                Text("key 只存本机 Keychain, 直连官方 API, 不经任何第三方服务器")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.ccTextDim)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 6)
+
+                Picker("", selection: Binding(
+                    get: { DirectAPIConfig.provider },
+                    set: { newProvider in
+                        DirectAPIConfig.provider = newProvider
+                        directAPITestResult = nil
+                        directAPITick &+= 1
+                    }
+                )) {
+                    ForEach(DirectAPIProvider.allCases) { p in
+                        Text(p.displayName).tag(p)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 8)
+
+                if DirectAPIConfig.provider == .openAICompat {
+                    rowToggleableText(label: "baseURL") {
+                        TextField(DirectAPIConfig.defaultOpenAICompatBaseURL, text: Binding(
+                            get: { DirectAPIConfig.baseURL },
+                            set: { DirectAPIConfig.baseURL = $0 }
+                        ))
+                        .textFieldStyle(.plain)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(Color.ccAccent)
+                        .multilineTextAlignment(.trailing)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                    }
+                }
+
+                rowToggleableText(label: "model") {
+                    TextField(DirectAPIConfig.provider.defaultModel, text: Binding(
+                        get: { DirectAPIConfig.model },
+                        set: { DirectAPIConfig.model = $0 }
+                    ))
+                    .textFieldStyle(.plain)
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(Color.ccAccent)
+                    .multilineTextAlignment(.trailing)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                }
+
+                rowToggleableText(label: DirectAPIConfig.hasApiKey ? "API key (已保存)" : "API key") {
+                    SecureField("sk-…", text: $directAPIKeyDraft)
+                        .textFieldStyle(.plain)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(Color.ccAccent)
+                        .multilineTextAlignment(.trailing)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .onSubmit(saveDirectAPIKeyDraft)
+                }
+
+                if let result = directAPITestResult {
+                    HStack(spacing: 6) {
+                        Image(systemName: result ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(result ? .green : .red)
+                        Text(result ? "连接成功" : directAPITestError)
+                            .font(.ccSerifAdaptive(size: 12))
+                            .foregroundStyle(Color.ccTextDim)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.top, 2)
+                }
+
+                actionRow(label: directAPITesting ? "测试中…" : "测试连通", color: .blue) {
+                    saveDirectAPIKeyDraft()
+                    Task { await testDirectAPIConnection() }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("AI 人格 (persona)")
+                        .font(.ccSerifAdaptive(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.ccTextDim)
+                    TextEditor(text: $directAPIPersonaDraft)
+                        .font(.system(size: 13))
+                        .frame(minHeight: 90)
+                        .scrollContentBackground(.hidden)
+                        .padding(6)
+                        .background(Color.ccBg.opacity(0.6))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .onChange(of: directAPIPersonaDraft) { _, newValue in
+                            DirectAPIConfig.persona = newValue
+                        }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+
+                if DirectAPIConfig.hasApiKey {
+                    actionRow(label: "清除 API key", color: .red) {
+                        DirectAPIConfig.setApiKey(nil)
+                        directAPIKeyDraft = ""
+                        directAPITestResult = nil
+                        directAPITick &+= 1
+                    }
+                }
+            }
+        }
+        .id("apidirect-\(directAPITick)")
+    }
+
+    private func saveDirectAPIKeyDraft() {
+        let trimmed = directAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        DirectAPIConfig.setApiKey(trimmed)
+        directAPIKeyDraft = ""
+        directAPITick &+= 1
+    }
+
+    private func testDirectAPIConnection() async {
+        directAPITesting = true
+        directAPITestResult = nil
+        defer { directAPITesting = false }
+        guard let key = DirectAPIConfig.apiKey, !key.isEmpty else {
+            directAPITestResult = false
+            directAPITestError = "没有配置 API key, 去设置页填一个"
+            return
+        }
+        let result = await DirectAPIClient.testConnection(
+            provider: DirectAPIConfig.provider,
+            baseURL: DirectAPIConfig.baseURL,
+            model: DirectAPIConfig.model,
+            apiKey: key
+        )
+        switch result {
+        case .success:
+            directAPITestResult = true
+        case .failure(let err):
+            directAPITestResult = false
+            directAPITestError = err.errorDescription ?? "连接失败"
+        }
     }
 
     @ViewBuilder

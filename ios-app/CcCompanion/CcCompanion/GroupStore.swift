@@ -7,6 +7,7 @@
 
 import Foundation
 import Combine
+import DirectAPICore
 
 nonisolated struct GroupPollResponse: Codable, Sendable {
     let ok: Bool
@@ -36,8 +37,11 @@ nonisolated struct GroupRosterOnlineResponse: Codable, Sendable {
 actor GroupNetworkClient {
     static let shared = GroupNetworkClient()
 
+    // 二审(P0-2): 群聊不是 directAPI 模式的功能门控对象, 但网络层兜底闸要覆盖"仓库里所有自建
+    // session"这条结构性承诺(不依赖记得每处改), 经 ccGuarded() 工厂显式注入 guard protocol.
+    // canInit() 只在 DirectAPIConfig.isActive 时才生效, 不影响群聊在 ccServer 模式下的现有行为.
     private let session: URLSession = {
-        let cfg = URLSessionConfiguration.default
+        let cfg = DirectAPIServerGuardProtocol.ccGuarded()
         cfg.timeoutIntervalForRequest = 20
         cfg.timeoutIntervalForResource = 25
         return URLSession(configuration: cfg)

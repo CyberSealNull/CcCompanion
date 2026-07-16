@@ -34,6 +34,16 @@
             skipped = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
+               BlueprintIdentifier = "2BDE029FF165C08E0DB8E21D"
+               BuildableName = "CcCompanionIntegrationTests.xctest"
+               BlueprintName = "CcCompanionIntegrationTests"
+               ReferencedContainer = "container:CcCompanion.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
                BlueprintIdentifier = "7707E16D086B5FCA423F9866"
                BuildableName = "CcCompanionUITests.xctest"
                BlueprintName = "CcCompanionUITests"

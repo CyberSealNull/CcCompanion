@@ -12,6 +12,7 @@ import Foundation
 import UIKit
 import UserNotifications
 import OSLog
+import DirectAPICore
 
 @MainActor
 final class PushTokenManager {
@@ -21,8 +22,10 @@ final class PushTokenManager {
     var sharedSecret: String? { CcServerConfig.sharedSecret }
 
     private let logger = Logger(subsystem: "com.starryfield.CcCompanion", category: "DevicePushToken")
+    // 二审(P0-2): 这枚自建 session 也在 fresh probe 点名的漏网名单里, 经 ccGuarded() 工厂显式注入
+    // guard protocol —— _post 里已有的 DirectAPIConfig.isActive 早退是功能层门, 这里是网络层兜底.
     private let session: URLSession = {
-        let cfg = URLSessionConfiguration.default
+        let cfg = DirectAPIServerGuardProtocol.ccGuarded()
         cfg.timeoutIntervalForRequest = 10
         cfg.timeoutIntervalForResource = 15
         return URLSession(configuration: cfg)
@@ -53,6 +56,8 @@ final class PushTokenManager {
     }
 
     private func _post(token: String, aiName: String) async {
+        // P0 直连(code review P0-2): 门 B 全新用户没有 server, 不该把 device token 发给 placeholder/遗留配置.
+        guard !DirectAPIConfig.isActive else { return }
         logger.info("registering device token len=\(token.count) ai_name=\(aiName, privacy: .public)")
         let url = serverURL.appendingPathComponent("register-device-token")
         var req = URLRequest(url: url)

@@ -63,6 +63,8 @@ struct ContentView: View {
 
     private var needsOnboarding: Bool {
         if !onboardingCompleted { return true }
+        // P0 直连: 门 B 用户没有(也不需要) server host, 不能拿 ccServer 的 placeholder 判定卡死在 onboarding 循环里.
+        if DirectAPIConfig.isActive { return false }
         let host = CcServerConfig.serverURL.host ?? ""
         return host == "example.com" || host.isEmpty
     }
@@ -82,12 +84,21 @@ struct ContentView: View {
         var items: [FloatingTabBarItem] = [
             .init(id: 0, title: "聊天", systemImage: "bubble.left.and.bubble.right", badge: chatTabBadge),
         ]
-        if featureGroupView {
+        // P0 直连: 终端/群聊都是打 server 端点的功能, directAPI 模式下 gate 掉(单一门控读点 DirectAPIConfig.isActive).
+        if featureGroupView && !DirectAPIConfig.isActive {
             items.append(.init(id: 3, title: "群聊", systemImage: "person.3.sequence.fill", badge: groupTabBadge))
         }
-        items.append(.init(id: 1, title: "终端", systemImage: "terminal"))
+        if !DirectAPIConfig.isActive {
+            items.append(.init(id: 1, title: "终端", systemImage: "terminal"))
+        }
         items.append(.init(id: 2, title: "设置", systemImage: "gearshape.fill"))
         return items
+    }
+
+    private var onEnterTerminal: () -> Void {
+        // P0 直连: 终端(TerminalView)整个是 tmux/sessions 打 server, directAPI 没有这条路; 双入口(tab bar +
+        // 微信主题昵称长按)都经这一个闭包, gate 收在这一处, WeChatHeaderBar 长按变成 no-op 不用另外改.
+        DirectAPIConfig.isActive ? {} : { selectedTab = 1 }
     }
 
     var body: some View {
@@ -95,13 +106,13 @@ struct ContentView: View {
         VStack(spacing: 0) {
             Group {
                 switch selectedTab {
-                case 0: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken, onEnterTerminal: { selectedTab = 1 }) }
+                case 0: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken, onEnterTerminal: onEnterTerminal, onShowSettings: { selectedTab = 2 }) }
                 // v2.8 R3b 真机修: 从终端返回聊天页时 bump chatScrollToken, 触发 ChatView .onChange(of:scrollToken)→scrollBottom,
                 // 否则视图复用不走 onAppear、token 不变不触发 onChange, 返回后卡在旧滚动位置要手动下拉。
-                case 1: NavigationStack { TerminalView(onBack: { selectedTab = 0; chatScrollToken &+= 1 }) }
+                case 1 where !DirectAPIConfig.isActive: NavigationStack { TerminalView(onBack: { selectedTab = 0; chatScrollToken &+= 1 }) }
                 case 2: NavigationStack { CcSettingsView() }
-                case 3 where featureGroupView: NavigationStack { GroupChatView(store: groupStore) }
-                default: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken, onEnterTerminal: { selectedTab = 1 }) }
+                case 3 where featureGroupView && !DirectAPIConfig.isActive: NavigationStack { GroupChatView(store: groupStore) }
+                default: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken, onEnterTerminal: onEnterTerminal, onShowSettings: { selectedTab = 2 }) }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -137,20 +148,24 @@ struct ContentView: View {
         }
         .task {
             // Phase multi-server fallback — kick off endpoint resolver (background ping every 60s).
+            // (directAPI 用户通常 endpoints 为空, resolveOnce 空列表早退, 无害不用额外 gate.)
             EndpointResolver.shared.start()
             // Build 215 T1 — featureGroupView 开关下后台跑 group polling, tab badge 才能在用户不进群聊 tab 时增长
-            if featureGroupView {
+            // P0 直连: group/chat badge 轮询都打 server 端点, directAPI 模式下 gate 掉.
+            if featureGroupView && !DirectAPIConfig.isActive {
                 groupStore.start()
             }
             // Build 215 P4 — chat badge polling 一直跑 (不绑 feature flag, 聊天 tab 永远存在)
-            chatBadgeStore.start()
+            if !DirectAPIConfig.isActive {
+                chatBadgeStore.start()
+            }
             // Build 218 B1 — 启动时根据当前 tab 同步 isChatTabActive (cold start tab 0 默认)
             chatBadgeStore.isChatTabActive = (selectedTab == 0)
             // r5: 同款 cold start 群聊 tab active flag
             groupStore.isGroupTabActive = (selectedTab == 3)
         }
         .onChange(of: featureGroupView) { _, enabled in
-            if enabled {
+            if enabled && !DirectAPIConfig.isActive {
                 groupStore.start()
             } else {
                 groupStore.stop()

@@ -11,6 +11,7 @@ import SwiftUI
 import Foundation
 import Combine
 import AudioToolbox
+import DirectAPICore
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -27,8 +28,9 @@ final class TerminalViewModel: ObservableObject {
     private var pollingTask: Task<Void, Never>? = nil
     private var lastDecisionTriggerAt: Date? = nil
     private var lastDecisionPromptSignature: String? = nil
+    // 二审(P0-2): review 点名的"Terminal 等其它路径"漏网自建 session, 经 ccGuarded() 工厂显式注入 guard protocol.
     private let urlSession: URLSession = {
-        let cfg = URLSessionConfiguration.default
+        let cfg = DirectAPIServerGuardProtocol.ccGuarded()
         cfg.timeoutIntervalForRequest = 6
         cfg.timeoutIntervalForResource = 10
         return URLSession(configuration: cfg)
