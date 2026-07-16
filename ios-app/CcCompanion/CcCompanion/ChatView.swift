@@ -821,7 +821,18 @@ final class ChatViewModel: ObservableObject {
 
     private func canCommit(generation: Int, mode: ChatBackendMode? = nil) -> Bool {
         guard !Task.isCancelled, generation == modeGeneration else { return false }
-        return mode.map { $0 == DirectAPIConfig.mode } ?? true
+        guard let mode else { return true }
+        let currentMode = DirectAPIConfig.mode
+        guard mode == currentMode else {
+            // 真机冷启动时 app-group defaults 可能在初次读取后才就绪。这个漂移不会经过
+            // DirectAPIConfig setter，因此没有 ccDirectAPIModeChanged 通知。旧实现只拒绝提交，
+            // 初代 polling 随即退出且无人补起新代，聊天页会永久空白。把漂移收敛回同一条
+            // 串行 transition 路径，保留 generation ownership 与冻结 scope 的全部边界。
+            print("[chat-mode] unnotified drift \(mode.rawValue) -> \(currentMode.rawValue); enqueue transition")
+            enqueueModeTransition(to: currentMode)
+            return false
+        }
+        return true
     }
 
     private func canStartOperation(generation: Int, mode: ChatBackendMode) -> Bool {
@@ -932,7 +943,7 @@ final class ChatViewModel: ObservableObject {
     /// lastTs/settingsEtag 不用手动清: start() 里 loadCachedHistory() 马上会用新模式的本地数据覆盖它们.
     private func handleModeChange(to mode: ChatBackendMode, generation: Int) async {
         await stopAndWait()
-        guard generation == modeGeneration, mode == DirectAPIConfig.mode else { return }
+        guard canCommit(generation: generation, mode: mode) else { return }
         messages = []
         displayedRowsCache = []
         serverSearchResults = []
@@ -947,7 +958,7 @@ final class ChatViewModel: ObservableObject {
         thinkingInFlightTurns = []
         hasMoreEarlier = true
         await startPolling(mode: mode, generation: generation)
-        guard generation == modeGeneration, mode == DirectAPIConfig.mode else { return }
+        guard canCommit(generation: generation, mode: mode) else { return }
         settledModeGeneration = generation
     }
     @Published private(set) var visibleLimit: Int = 300 { didSet { rebuildDisplayedRowsCache() } }
@@ -3630,12 +3641,6 @@ struct ChatView: View {
         }
     }
 
-    private func handleSpeechTranscriptChange(_ newValue: String) {
-        if speech.isRecording {
-            vm.draft = newValue
-        }
-    }
-
     private func toggleAllDisplayedSelection() {
         if vm.selectedTs.count == vm.selectableDisplayedMessages.count {
             vm.selectedTs.removeAll()
@@ -4367,7 +4372,7 @@ private struct ChatInputBar: View {
                 .submitLabel(.send)
                 .onSubmit { commitFromSubmit() }
                 .onChange(of: draftLocal) { oldValue, newValue in
-                    vm.draft = newValue
+                    // 打字解耦: draft 留在 view-local State，不做每字符 Published 写回。
                     if newValue.hasSuffix("\n") && !oldValue.hasSuffix("\n") {
                         draftLocal = String(newValue.dropLast())
                         commitFromSubmit()
@@ -4449,7 +4454,7 @@ private struct ChatInputBar: View {
                         commitFromSubmit()
                     }
                     .onChange(of: draftLocal) { oldValue, newValue in
-                        vm.draft = newValue
+                        // 打字解耦: draft 留在 view-local State，不做每字符 Published 写回。
                         if newValue.hasSuffix("\n") && !oldValue.hasSuffix("\n") {
                             if slashPopoverVisible, slashCandidates.indices.contains(slashHighlightIndex) {
                                 draftLocal = String(newValue.dropLast())
@@ -4619,9 +4624,8 @@ private struct ChatInputBar: View {
             return
         }
         guard !text.isEmpty else { return }
-        // 2026-05-12 send race fix — hand off an explicit snapshot so the
-        // upcoming `draftLocal = ""` (and its onChange, which writes vm.draft)
-        // can't blank the value before the async send actually reads it.
+        // 2026-05-12 send race fix — hand off an explicit snapshot so the upcoming
+        // `draftLocal = ""` can't blank the value before the async send actually reads it.
         // vm.quoting is left for send() to consume + clear since picking a
         // quoted message is a separate user action without a race window.
         draftLocal = ""

@@ -19,7 +19,6 @@ import UIKit
 @MainActor
 final class TerminalViewModel: ObservableObject {
     @Published var content: String = ""
-    @Published var draft: String = ""
     @Published var session: String = ""
     @Published var sessions: [String] = []
     @Published var sending: Bool = false
@@ -194,13 +193,13 @@ final class TerminalViewModel: ObservableObject {
         }
     }
 
-    func send(enter: Bool = true) async {
-        let keys = draft
-        guard !keys.isEmpty || !enter else { return }
+    @discardableResult
+    func send(keys: String, enter: Bool = true) async -> Bool {
+        guard !keys.isEmpty || !enter else { return false }
         sending = true
         defer { sending = false }
         await ensureSessionSelected()
-        guard !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
 
         let url = CcServerConfig.serverURL.appendingPathComponent("tmux/send")
         var req = URLRequest(url: url)
@@ -217,11 +216,12 @@ final class TerminalViewModel: ObservableObject {
         req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         do {
             _ = try await urlSession.data(for: req)
-            self.draft = ""
             // 立刻 fetch 一次更新输出
             await fetchCapture()
+            return true
         } catch {
             self.lastError = "发送失败: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -336,6 +336,8 @@ final class TerminalViewModel: ObservableObject {
 
 struct TerminalView: View {
     @StateObject private var vm = TerminalViewModel()
+    // 打字解耦: 输入态留在 View，不再每字符发布整个 TerminalViewModel。
+    @State private var draftLocal: String = ""
     @FocusState private var inputFocused: Bool
     // v2.8 R3b: 观察 ThemeStore 让运行时切微信主题立即重渲终端页皮 (cc 共享单例 state 必须 observe, 否则切主题 body 不重算).
     @ObservedObject private var themeStore = ThemeStore.shared
@@ -478,13 +480,13 @@ struct TerminalView: View {
                     .font(.system(size: 14, design: .monospaced).weight(.bold))
                     .foregroundStyle(skinAccent)
 
-                TextField("", text: $vm.draft, prompt: Text("命令").foregroundStyle(skinDim), axis: .vertical)
+                TextField("", text: $draftLocal, prompt: Text("命令").foregroundStyle(skinDim), axis: .vertical)
                     .lineLimit(1...4)
                     .font(.system(size: 13, design: .monospaced))
                     .foregroundStyle(skinText)
                     .focused($inputFocused)
                     .submitLabel(.send)
-                    .onSubmit { Task { await vm.send() } }
+                    .onSubmit { sendDraft() }
                     .autocorrectionDisabled(true)
                     .textInputAutocapitalization(.never)
 
@@ -493,11 +495,11 @@ struct TerminalView: View {
                 // 工具栏 clear 是 user-facing 单一入口. sendClearScreen() function 保留 dead 不删
                 // Phase D amendment #19 — ESC + ^C 按钮删 (走 /stop slash 命令中断)
                 Button {
-                    Task { await vm.send() }
+                    sendDraft()
                 } label: {
                     Image(systemName: vm.sending ? "ellipsis.circle" : "return")
                         .font(.ccSerifAdaptive(size: 20, weight: .semibold))
-                        .foregroundStyle(vm.draft.isEmpty && !vm.sending ? (isWechat ? WechatTermSkin.ink.opacity(0.25) : Color.white.opacity(0.25)) : skinAccent)
+                        .foregroundStyle(draftLocal.isEmpty && !vm.sending ? (isWechat ? WechatTermSkin.ink.opacity(0.25) : Color.white.opacity(0.25)) : skinAccent)
                 }
                 .disabled(vm.sending)
             }
@@ -512,6 +514,16 @@ struct TerminalView: View {
         #endif
         .onAppear { vm.start() }
         .onDisappear { vm.stop() }
+    }
+
+    private func sendDraft() {
+        let keys = draftLocal
+        guard !keys.isEmpty else { return }
+        Task {
+            if await vm.send(keys: keys) {
+                draftLocal = ""
+            }
+        }
     }
 }
 
