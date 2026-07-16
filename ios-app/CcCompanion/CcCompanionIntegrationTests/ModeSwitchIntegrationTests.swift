@@ -11,6 +11,7 @@
 //  是否出現在哪個 scope", 不假設庫是空的 —— 對已有真實資料(或其它測試殘留)保持健壯.
 
 import XCTest
+import DirectAPICore
 @testable import CcCompanion
 
 private final class DirectStreamHarness: @unchecked Sendable {
@@ -80,6 +81,160 @@ final class ModeSwitchIntegrationTests: XCTestCase {
         let result = await HangingURLProtocol.waitForRequestReceived(timeout: 0.05)
 
         XCTAssertFalse(result)
+    }
+
+    private func preservingProviderConfig(_ body: () -> Void) {
+        let defaults = UserDefaults.standard
+        let keys = ["directapi.provider", "directapi.baseURL", "directapi.model"]
+        let snapshot = keys.map { ($0, defaults.object(forKey: $0)) }
+        defer {
+            for (key, value) in snapshot {
+                if let value {
+                    defaults.set(value, forKey: key)
+                } else {
+                    defaults.removeObject(forKey: key)
+                }
+            }
+        }
+        body()
+    }
+
+    private func stubTerminalSend(status: Int, error: String? = nil) {
+        HangingURLProtocol.responseProvider = { request in
+            let isSend = request.url?.path.hasSuffix("/tmux/send") == true
+            let payload: [String: Any]
+            let responseStatus: Int
+            if isSend {
+                responseStatus = status
+                payload = status >= 200 && status < 300
+                    ? ["ok": true, "session": "test-session"]
+                    : ["error": error ?? "request failed"]
+            } else {
+                responseStatus = 200
+                payload = ["ok": true, "content": "capture"]
+            }
+            return HangingURLProtocol.StubResponse(
+                status: responseStatus,
+                headers: ["Content-Type": "application/json"],
+                body: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+            )
+        }
+    }
+
+    // MARK: - User-visible regression coverage
+
+    func testStandardChatDraftOwnerRestoresAfterInputRecreation() {
+        let owner = ChatDraftStore()
+        let draft = "standard-draft-\(UUID().uuidString)"
+
+        owner.capture(draft)
+        let replacementInput = owner
+
+        XCTAssertEqual(replacementInput.restore(fallback: ""), draft)
+    }
+
+    func testWechatChatDraftOwnerRestoresAfterInputRecreation() {
+        let owner = ChatDraftStore()
+        let draft = "wechat-draft-\(UUID().uuidString)"
+
+        owner.capture(draft)
+        let replacementInput = owner
+
+        XCTAssertEqual(replacementInput.restore(fallback: ""), draft)
+    }
+
+    func testTerminalHTTP403ReturnsFailureAndSurfacesServerError() async {
+        stubTerminalSend(status: 403, error: "remote control disabled")
+        await HangingURLProtocol.release()
+        let vm = TerminalViewModel(urlSession: HangingURLProtocol.makeSession())
+        vm.session = "test-session"
+
+        let sent = await vm.send(keys: "pwd")
+
+        XCTAssertFalse(sent)
+        XCTAssertTrue(vm.lastError?.contains("403") == true)
+        XCTAssertTrue(vm.lastError?.contains("remote control disabled") == true)
+    }
+
+    func testTerminalHTTP500ReturnsFailureAndSurfacesServerError() async {
+        stubTerminalSend(status: 500, error: "tmux failed")
+        await HangingURLProtocol.release()
+        let vm = TerminalViewModel(urlSession: HangingURLProtocol.makeSession())
+        vm.session = "test-session"
+
+        let sent = await vm.send(keys: "pwd")
+
+        XCTAssertFalse(sent)
+        XCTAssertTrue(vm.lastError?.contains("500") == true)
+        XCTAssertTrue(vm.lastError?.contains("tmux failed") == true)
+    }
+
+    func testTerminalDelayedSuccessDoesNotClearNewerDraft() async {
+        stubTerminalSend(status: 200)
+        let vm = TerminalViewModel(urlSession: HangingURLProtocol.makeSession())
+        vm.session = "test-session"
+        let sentDraft = "git status"
+        var currentDraft = sentDraft
+
+        let sendTask = Task { await vm.send(keys: sentDraft) }
+        guard await HangingURLProtocol.waitForRequestReceived() else {
+            XCTFail("terminal send request did not arrive")
+            return
+        }
+        currentDraft += " --short"
+        await HangingURLProtocol.release()
+        let succeeded = await sendTask.value
+        currentDraft = TerminalDraftOwnership.resolvedDraft(
+            current: currentDraft,
+            sent: sentDraft,
+            succeeded: succeeded
+        )
+
+        XCTAssertTrue(succeeded)
+        XCTAssertEqual(currentDraft, "git status --short")
+        XCTAssertEqual(
+            TerminalDraftOwnership.resolvedDraft(current: sentDraft, sent: sentDraft, succeeded: true),
+            ""
+        )
+    }
+
+    func testOpenAICompatToOtherClearsURLAndModel() {
+        preservingProviderConfig {
+            DirectAPIConfig.provider = .openAICompat
+            DirectAPIConfig.baseURL = "https://old.example/v1"
+            DirectAPIConfig.model = "old-model"
+
+            DirectAPIConfig.provider = .other
+
+            XCTAssertEqual(DirectAPIConfig.baseURL, "")
+            XCTAssertEqual(DirectAPIConfig.model, "")
+        }
+    }
+
+    func testAnthropicToOtherClearsURLAndModel() {
+        preservingProviderConfig {
+            DirectAPIConfig.provider = .anthropic
+            DirectAPIConfig.baseURL = "https://old.example/v1"
+            DirectAPIConfig.model = "old-model"
+
+            DirectAPIConfig.provider = .other
+
+            XCTAssertEqual(DirectAPIConfig.baseURL, "")
+            XCTAssertEqual(DirectAPIConfig.model, "")
+        }
+    }
+
+    func testOtherToOpenAICompatRestoresProviderDefaults() {
+        preservingProviderConfig {
+            DirectAPIConfig.provider = .other
+            DirectAPIConfig.baseURL = "https://custom.example/v1"
+            DirectAPIConfig.model = "custom-model"
+
+            DirectAPIConfig.provider = .openAICompat
+
+            XCTAssertEqual(DirectAPIConfig.baseURL, DirectAPIConfig.defaultOpenAICompatBaseURL)
+            XCTAssertEqual(DirectAPIConfig.model, DirectAPIProvider.openAICompat.defaultModel)
+        }
     }
 
     // MARK: - Fixtures
@@ -381,9 +536,9 @@ final class ModeSwitchIntegrationTests: XCTestCase {
         }
 
         NotificationCenter.default.post(name: NSNotification.Name("CcResyncHistory"), object: nil)
-        let firstBackfillArrived = await HangingURLProtocol.waitForRequestReceived(count: 2, timeout: 0.3)
+        let firstBackfillArrived = await HangingURLProtocol.waitForRequestReceived(count: 2)
         NotificationCenter.default.post(name: NSNotification.Name("CcResyncHistory"), object: nil)
-        let replacementBackfillArrived = await HangingURLProtocol.waitForRequestReceived(count: 3, timeout: 0.3)
+        let replacementBackfillArrived = await HangingURLProtocol.waitForRequestReceived(count: 3)
 
         let startingGeneration = vm.modeGeneration
         DirectAPIConfig.mode = .directAPI
@@ -525,6 +680,73 @@ final class ModeSwitchIntegrationTests: XCTestCase {
             vm.messages.contains { $0.text == marker },
             "无通知 mode 漂移后没有补起 directAPI transition，本地历史仍不可见"
         )
+    }
+
+    func testUnnotifiedDriftThenManualFastSwitchSettlesFinalGeneration() async {
+        let ts = "1899-06-03T00:00:00.000Z"
+        let marker = "drift-fast-switch-\(UUID().uuidString)"
+        defer { cleanupFixture(ts: ts, role: "user") }
+        ChatStore.shared.snapshot(.directAPI).upsert([ChatMessage(
+            ts: ts, role: "user", text: marker, source: "ios-app",
+            quotedTs: nil, quotedText: nil, attachmentUrl: nil, attachmentType: nil,
+            attachmentFilename: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+            location: nil, metadata: nil, localId: nil
+        )])
+
+        let emptyHistory = (try? JSONSerialization.data(withJSONObject: [
+            "ok": true,
+            "records": [],
+        ])) ?? Data()
+        HangingURLProtocol.responseProvider = { _ in
+            HangingURLProtocol.StubResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: emptyHistory
+            )
+        }
+
+        DirectAPIConfig.mode = .ccServer
+        let fakeClient = ChatNetworkClient(session: HangingURLProtocol.makeSession())
+        let vm = ChatViewModel(session: HangingURLProtocol.makeSession(), networkClient: fakeClient)
+        defer { vm.stop() }
+        await vm.start()
+        guard await HangingURLProtocol.waitForRequestReceived() else {
+            XCTFail("initial ccServer bootstrap did not arrive")
+            return
+        }
+
+        UserDefaults(suiteName: CcServerConfig.appGroup)?.set(
+            ChatBackendMode.directAPI.rawValue,
+            forKey: "directapi.mode"
+        )
+        let initialGeneration = vm.modeGeneration
+        await HangingURLProtocol.release()
+
+        var spins = 0
+        while vm.modeGeneration == initialGeneration && spins < 3000 {
+            await Task.yield()
+            spins += 1
+        }
+        XCTAssertEqual(vm.modeGeneration, initialGeneration + 1, "drift must enqueue exactly one transition")
+
+        DirectAPIConfig.mode = .directAPI
+        DirectAPIConfig.mode = .ccServer
+        DirectAPIConfig.mode = .directAPI
+        await waitForTransitionToSettle(vm, after: initialGeneration)
+
+        var markerSpins = 0
+        while !vm.messages.contains(where: { $0.text == marker }) && markerSpins < 3000 {
+            await Task.yield()
+            markerSpins += 1
+        }
+        let settledGeneration = vm.modeGeneration
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(DirectAPIConfig.mode, .directAPI)
+        XCTAssertEqual(settledGeneration, initialGeneration + 3)
+        XCTAssertEqual(vm.modeGeneration, settledGeneration, "late stale work must not enqueue another transition")
+        XCTAssertEqual(vm.settledModeGeneration, settledGeneration)
+        XCTAssertTrue(vm.messages.contains { $0.text == marker })
     }
 
     func testDirectModeAppPathsCaptureNoServerRequests() async {
