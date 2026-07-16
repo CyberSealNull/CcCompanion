@@ -439,6 +439,94 @@ final class ModeSwitchIntegrationTests: XCTestCase {
         XCTAssertEqual(vm.jumpScrollTarget, secondTs + "assistant")
     }
 
+    // 真机报告 2026-07-16: 直连模式聊完, 杀 app 重进, 聊天页空空.
+    // 探针: directAPI 库里已有记录, fresh VM(模拟冷启动)在 directAPI 模式 start() 后记录必须回到 UI.
+    func testDirectAPIColdStartLoadsCachedHistory() async {
+        let ts = "1899-06-01T00:00:00.000Z"
+        let marker = "cold-start-probe-\(UUID().uuidString)"
+        defer { cleanupFixture(ts: ts, role: "user") }
+        ChatStore.shared.snapshot(.directAPI).upsert([ChatMessage(
+            ts: ts, role: "user", text: marker, source: "ios-app",
+            quotedTs: nil, quotedText: nil, attachmentUrl: nil, attachmentType: nil,
+            attachmentFilename: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+            location: nil, metadata: nil, localId: nil
+        )])
+
+        DirectAPIConfig.mode = .directAPI
+        let fakeClient = ChatNetworkClient(session: HangingURLProtocol.makeSession())
+        let vm = ChatViewModel(session: HangingURLProtocol.makeSession(), networkClient: fakeClient)
+        await vm.start()
+        var i = 0
+        while !vm.messages.contains(where: { $0.text == marker }) && i < 3000 {
+            await Task.yield()
+            i += 1
+        }
+        XCTAssertTrue(
+            vm.messages.contains { $0.text == marker },
+            "directAPI 冷启动没把本地缓存加载回 UI (loadCachedHistory 线断了)"
+        )
+        vm.stop()
+    }
+
+    // 真机 app-group domain 冷启动可能先回落 ccServer，随后在没有
+    // ccDirectAPIModeChanged 通知的情况下变为 directAPI。初代启动若只拒绝旧 mode 的提交、
+    // 却不补起新 mode transition，就会永久停在空页。这里直接写 suite 模拟同族时序。
+    func testColdStartUnnotifiedModeDriftRestartsIntoDirectCache() async {
+        let ts = "1899-06-02T00:00:00.000Z"
+        let marker = "cold-start-drift-\(UUID().uuidString)"
+        defer { cleanupFixture(ts: ts, role: "user") }
+        ChatStore.shared.snapshot(.directAPI).upsert([ChatMessage(
+            ts: ts, role: "user", text: marker, source: "ios-app",
+            quotedTs: nil, quotedText: nil, attachmentUrl: nil, attachmentType: nil,
+            attachmentFilename: nil, audioZh: nil, audioEn: nil, audioJa: nil,
+            location: nil, metadata: nil, localId: nil
+        )])
+
+        let emptyHistory = (try? JSONSerialization.data(withJSONObject: [
+            "ok": true,
+            "records": [],
+        ])) ?? Data()
+        HangingURLProtocol.responseProvider = { _ in
+            HangingURLProtocol.StubResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: emptyHistory
+            )
+        }
+
+        DirectAPIConfig.mode = .ccServer
+        let fakeClient = ChatNetworkClient(session: HangingURLProtocol.makeSession())
+        let vm = ChatViewModel(session: HangingURLProtocol.makeSession(), networkClient: fakeClient)
+        defer { vm.stop() }
+        await vm.start()
+        guard await HangingURLProtocol.waitForRequestReceived() else {
+            XCTFail("初代 ccServer bootstrap 请求未到达，无法建立受控 mode 漂移时序")
+            return
+        }
+
+        // 绕过 DirectAPIConfig setter，刻意不发自定义 mode-change notification。
+        UserDefaults(suiteName: CcServerConfig.appGroup)?.set(
+            ChatBackendMode.directAPI.rawValue,
+            forKey: "directapi.mode"
+        )
+        XCTAssertEqual(DirectAPIConfig.mode, .directAPI)
+        let initialGeneration = vm.modeGeneration
+        await HangingURLProtocol.release()
+        await waitForTransitionToSettle(vm, after: initialGeneration)
+        var i = 0
+        while !vm.messages.contains(where: { $0.text == marker }) && i < 3000 {
+            await Task.yield()
+            i += 1
+        }
+
+        XCTAssertGreaterThan(vm.modeGeneration, initialGeneration)
+        XCTAssertEqual(vm.settledModeGeneration, vm.modeGeneration)
+        XCTAssertTrue(
+            vm.messages.contains { $0.text == marker },
+            "无通知 mode 漂移后没有补起 directAPI transition，本地历史仍不可见"
+        )
+    }
+
     func testDirectModeAppPathsCaptureNoServerRequests() async {
         DirectAPIConfig.mode = .directAPI
         let fakeClient = ChatNetworkClient(session: HangingURLProtocol.makeSession())
