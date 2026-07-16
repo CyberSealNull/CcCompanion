@@ -7,11 +7,19 @@ final class ProviderDefaultsTests: XCTestCase {
     }
 
     func testOpenAICompatDefaultModel() {
-        XCTAssertEqual(DirectAPIProvider.openAICompat.defaultModel, "gpt-4o")
+        XCTAssertEqual(DirectAPIProvider.openAICompat.defaultModel, "gpt-5.6")
+    }
+
+    func testOtherIsBlankSlateOnOpenAICompatWire() {
+        XCTAssertEqual(DirectAPIProvider.other.defaultModel, "")
+        XCTAssertTrue(DirectAPIProvider.other.usesOpenAICompatWire)
+        XCTAssertTrue(DirectAPIProvider.other.needsBaseURL)
+        XCTAssertFalse(DirectAPIProvider.anthropic.usesOpenAICompatWire)
+        XCTAssertTrue(DirectAPIProvider.openAICompat.usesOpenAICompatWire)
     }
 
     func testAllCasesCovered() {
-        XCTAssertEqual(Set(DirectAPIProvider.allCases), [.anthropic, .openAICompat])
+        XCTAssertEqual(Set(DirectAPIProvider.allCases), [.anthropic, .openAICompat, .other])
     }
 
     func testErrorDescriptionsAreHumanReadable() {

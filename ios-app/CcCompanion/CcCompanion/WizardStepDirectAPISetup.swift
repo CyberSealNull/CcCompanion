@@ -52,13 +52,15 @@ struct WizardStepDirectAPISetup: View {
                     .pickerStyle(.segmented)
                     .onChange(of: provider) { _, newValue in
                         model = newValue.defaultModel
+                        // 「其它」档全空白不预填, 换回 OpenAI 兼容档时恢复官方预设
+                        baseURL = newValue == .other ? "" : DirectAPIConfig.defaultOpenAICompatBaseURL
                         testStatus = .idle
                     }
 
-                    if provider == .openAICompat {
-                        labeledField(label: "baseURL", text: $baseURL, placeholder: DirectAPIConfig.defaultOpenAICompatBaseURL, keyboard: .URL)
+                    if provider.needsBaseURL {
+                        labeledField(label: "baseURL", text: $baseURL, placeholder: provider == .other ? "https://…" : DirectAPIConfig.defaultOpenAICompatBaseURL, keyboard: .URL)
                     }
-                    labeledField(label: "model", text: $model, placeholder: provider.defaultModel)
+                    labeledField(label: "model", text: $model, placeholder: provider.defaultModel.isEmpty ? "模型名" : provider.defaultModel)
                     labeledSecureField(label: "API key", text: $apiKey, placeholder: "sk-…")
 
                     statusView
@@ -83,7 +85,7 @@ struct WizardStepDirectAPISetup: View {
                 .disabled(trimmedKey.isEmpty || testStatus == .testing)
 
                 Button {
-                    onNext(provider, provider == .openAICompat ? baseURL : "", model, trimmedKey)
+                    onNext(provider, provider.needsBaseURL ? baseURL : "", model, trimmedKey)
                 } label: {
                     Text("下一步")
                         .font(.ccSerifAdaptive(size: 16, weight: .semibold))
@@ -164,7 +166,7 @@ struct WizardStepDirectAPISetup: View {
         testStatus = .testing
         let result = await DirectAPIClient.testConnection(
             provider: provider,
-            baseURL: provider == .openAICompat ? baseURL : "",
+            baseURL: provider.needsBaseURL ? baseURL : "",
             model: model,
             apiKey: trimmedKey
         )

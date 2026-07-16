@@ -80,7 +80,7 @@ public enum DirectAPIClient {
     public static func adapter(for provider: DirectAPIProvider, baseURL: String) -> DirectAPIProviderAdapting {
         switch provider {
         case .anthropic: return AnthropicAdapter()
-        case .openAICompat: return OpenAICompatAdapter(baseURL: baseURL)
+        case .openAICompat, .other: return OpenAICompatAdapter(baseURL: baseURL)
         }
     }
 

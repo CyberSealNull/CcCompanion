@@ -1723,7 +1723,7 @@ struct CcSettingsView: View {
                 .padding(.horizontal, 14)
                 .padding(.bottom, 8)
 
-                if DirectAPIConfig.provider == .openAICompat {
+                if DirectAPIConfig.provider.needsBaseURL {
                     rowToggleableText(label: "baseURL") {
                         TextField(DirectAPIConfig.defaultOpenAICompatBaseURL, text: Binding(
                             get: { DirectAPIConfig.baseURL },

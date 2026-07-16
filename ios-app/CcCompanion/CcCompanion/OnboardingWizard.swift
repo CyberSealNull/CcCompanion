@@ -425,7 +425,7 @@ struct OnboardingWizard: View {
     /// 返回都不会让 app 半配置地卡进 directAPI 模式.
     private func persistDirectAPISetup(provider: DirectAPIProvider, baseURL: String, model: String, key: String) {
         DirectAPIConfig.provider = provider
-        if provider == .openAICompat, !baseURL.isEmpty {
+        if provider.needsBaseURL, !baseURL.isEmpty {
             DirectAPIConfig.baseURL = baseURL
         }
         if !model.isEmpty {
