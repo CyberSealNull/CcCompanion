@@ -28,12 +28,18 @@ final class TerminalViewModel: ObservableObject {
     private var lastDecisionTriggerAt: Date? = nil
     private var lastDecisionPromptSignature: String? = nil
     // 二审(P0-2): review 点名的"Terminal 等其它路径"漏网自建 session, 经 ccGuarded() 工厂显式注入 guard protocol.
-    private let urlSession: URLSession = {
-        let cfg = DirectAPIServerGuardProtocol.ccGuarded()
-        cfg.timeoutIntervalForRequest = 6
-        cfg.timeoutIntervalForResource = 10
-        return URLSession(configuration: cfg)
-    }()
+    private let urlSession: URLSession
+
+    init(urlSession: URLSession? = nil) {
+        if let urlSession {
+            self.urlSession = urlSession
+        } else {
+            let cfg = DirectAPIServerGuardProtocol.ccGuarded()
+            cfg.timeoutIntervalForRequest = 6
+            cfg.timeoutIntervalForResource = 10
+            self.urlSession = URLSession(configuration: cfg)
+        }
+    }
 
     func start() {
         pollingTask?.cancel()
@@ -215,7 +221,22 @@ final class TerminalViewModel: ObservableObject {
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         do {
-            _ = try await urlSession.data(for: req)
+            let (data, response) = try await urlSession.data(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                lastError = "发送失败: 无效响应"
+                return false
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                let serverError = Self.serverError(from: data) ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
+                lastError = "发送失败 (\(http.statusCode)): \(serverError)"
+                return false
+            }
+            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["ok"] as? Bool == true else {
+                lastError = "发送失败: server 未确认成功"
+                return false
+            }
+            lastError = nil
             // 立刻 fetch 一次更新输出
             await fetchCapture()
             return true
@@ -223,6 +244,13 @@ final class TerminalViewModel: ObservableObject {
             self.lastError = "发送失败: \(error.localizedDescription)"
             return false
         }
+    }
+
+    private static func serverError(from data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let error = object["error"] as? String,
+              !error.isEmpty else { return nil }
+        return error
     }
 
     // 2026-05-19 真发特殊键 走 server 新增 `key` 字段 (tmux send-keys 键名)
@@ -520,10 +548,20 @@ struct TerminalView: View {
         let keys = draftLocal
         guard !keys.isEmpty else { return }
         Task {
-            if await vm.send(keys: keys) {
-                draftLocal = ""
-            }
+            let succeeded = await vm.send(keys: keys)
+            draftLocal = TerminalDraftOwnership.resolvedDraft(
+                current: draftLocal,
+                sent: keys,
+                succeeded: succeeded
+            )
         }
+    }
+}
+
+enum TerminalDraftOwnership {
+    static func resolvedDraft(current: String, sent: String, succeeded: Bool) -> String {
+        guard succeeded, current == sent else { return current }
+        return ""
     }
 }
 

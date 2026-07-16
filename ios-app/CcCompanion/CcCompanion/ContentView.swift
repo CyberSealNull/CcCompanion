@@ -51,6 +51,7 @@ struct ContentView: View {
     @State private var showFavorites = false
     @State private var selectedTab: Int = 0
     @State private var chatScrollToken: Int = 0
+    @State private var chatDraftStore = ChatDraftStore()
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var theme = ThemeStore.shared
     // Build 215 T1 — GroupStore 提到 ContentView 层 让 tab badge 能读 unread / mention 计数.
@@ -106,13 +107,13 @@ struct ContentView: View {
         VStack(spacing: 0) {
             Group {
                 switch selectedTab {
-                case 0: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken, onEnterTerminal: onEnterTerminal, onShowSettings: { selectedTab = 2 }) }
+                case 0: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken, onEnterTerminal: onEnterTerminal, onShowSettings: { selectedTab = 2 }, draftStore: chatDraftStore) }
                 // v2.8 R3b 真机修: 从终端返回聊天页时 bump chatScrollToken, 触发 ChatView .onChange(of:scrollToken)→scrollBottom,
                 // 否则视图复用不走 onAppear、token 不变不触发 onChange, 返回后卡在旧滚动位置要手动下拉。
                 case 1 where !DirectAPIConfig.isActive: NavigationStack { TerminalView(onBack: { selectedTab = 0; chatScrollToken &+= 1 }) }
                 case 2: NavigationStack { CcSettingsView() }
                 case 3 where featureGroupView && !DirectAPIConfig.isActive: NavigationStack { GroupChatView(store: groupStore) }
-                default: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken, onEnterTerminal: onEnterTerminal, onShowSettings: { selectedTab = 2 }) }
+                default: NavigationStack { ChatView(onShowFavorites: { showFavorites = true }, scrollToken: chatScrollToken, onEnterTerminal: onEnterTerminal, onShowSettings: { selectedTab = 2 }, draftStore: chatDraftStore) }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)

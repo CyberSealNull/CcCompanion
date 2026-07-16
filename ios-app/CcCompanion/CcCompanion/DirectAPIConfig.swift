@@ -70,12 +70,27 @@ nonisolated enum DirectAPIConfig {
                   let p = DirectAPIProvider(rawValue: raw) else { return .anthropic }
             return p
         }
-        set { UserDefaults.standard.set(newValue.rawValue, forKey: kProvider) }
+        set {
+            let defaults = UserDefaults.standard
+            defaults.set(newValue.rawValue, forKey: kProvider)
+            switch newValue {
+            case .anthropic:
+                defaults.set("", forKey: kBaseURL)
+                defaults.set(newValue.defaultModel, forKey: kModel)
+            case .openAICompat:
+                defaults.set(defaultOpenAICompatBaseURL, forKey: kBaseURL)
+                defaults.set(newValue.defaultModel, forKey: kModel)
+            case .other:
+                defaults.set("", forKey: kBaseURL)
+                defaults.set("", forKey: kModel)
+            }
+        }
     }
 
     static var baseURL: String {
         get {
             let saved = UserDefaults.standard.string(forKey: kBaseURL) ?? ""
+            if provider == .other { return saved }
             return saved.isEmpty ? defaultOpenAICompatBaseURL : saved
         }
         set { UserDefaults.standard.set(newValue, forKey: kBaseURL) }

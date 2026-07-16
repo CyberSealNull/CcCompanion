@@ -3520,6 +3520,23 @@ final class ChatViewModel: ObservableObject {
     }
 }
 
+@MainActor
+final class ChatDraftStore {
+    private var capturedDraft: String?
+
+    func capture(_ draft: String) {
+        capturedDraft = draft
+    }
+
+    func restore(fallback: String) -> String {
+        capturedDraft ?? fallback
+    }
+
+    func clear() {
+        capturedDraft = ""
+    }
+}
+
 struct ChatView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var vm = ChatViewModel()
@@ -3566,6 +3583,7 @@ struct ChatView: View {
     var onEnterTerminal: () -> Void = {}
     // P0 直连: 顶栏「直连」pill 点击进设置页. 同款透传, ContentView 传 { selectedTab = 2 }.
     var onShowSettings: () -> Void = {}
+    var draftStore: ChatDraftStore = ChatDraftStore()
 
     private func statusColor(for status: ChatConnectionStatus) -> Color {
         switch status {
@@ -3883,6 +3901,7 @@ struct ChatView: View {
                 ChatInputBar(
                     vm: vm,
                     speech: speech,
+                    draftStore: draftStore,
                     inputFocused: $inputFocused,
                     imagePreviews: $selectedImagePreviews,
                     onImage: { showImagePicker = true },
@@ -4280,6 +4299,7 @@ private struct ChatInputBar: View {
 
     @ObservedObject var vm: ChatViewModel
     @ObservedObject var speech: SpeechRecognizer
+    let draftStore: ChatDraftStore
     let inputFocused: FocusState<Bool>.Binding
     @Binding var imagePreviews: [ImagePreview]
     let onImage: () -> Void
@@ -4324,6 +4344,14 @@ private struct ChatInputBar: View {
         .sheet(isPresented: $showStickerPanel) {
             StickerPickerSheet()
                 .presentationDetents([.medium, .large])
+        }
+        .onAppear {
+            // 打字期间只改 view-local State；跨 tab 重建时从 ContentView 持有的低频草稿 owner 恢复。
+            if draftLocal.isEmpty { draftLocal = draftStore.restore(fallback: vm.draft) }
+            storedPlaceholder = ChatInputBar.placeholders.randomElement() ?? "Waiting…"
+        }
+        .onDisappear {
+            draftStore.capture(draftLocal)
         }
     }
 
@@ -4520,12 +4548,6 @@ private struct ChatInputBar: View {
             // 上传期间 vm.sending=true). slash command 走 send() 内 handleSlashCommand 单独路径.
             .disabled(commitPending)
         }
-        .onAppear {
-            // 2026-05-10 用户 push 切 tab 不丢草稿 view 重建 onAppear 从 vm.draft init draftLocal
-            if draftLocal.isEmpty && !vm.draft.isEmpty { draftLocal = vm.draft }
-            // 切 chat tab 回来时重选 placeholder (不每帧动)
-            storedPlaceholder = ChatInputBar.placeholders.randomElement() ?? "Waiting…"
-        }
         // 2026-05-07 stop button 加 0.5s 延迟显示防发送瞬间闪
         .onChange(of: vm.isCcWorking) { _, working in
             if working {
@@ -4559,6 +4581,7 @@ private struct ChatInputBar: View {
     }
 
     private func syncToVM() {
+        draftStore.capture(draftLocal)
         vm.draft = draftLocal
     }
 
@@ -4611,6 +4634,7 @@ private struct ChatInputBar: View {
             let quotedShared = vm.quoting?.ts
             vm.quoting = nil
             draftLocal = ""
+            draftStore.clear()
             Task {
                 for (idx, preview) in previews.enumerated() {
                     await vm.upload(
@@ -4629,6 +4653,7 @@ private struct ChatInputBar: View {
         // vm.quoting is left for send() to consume + clear since picking a
         // quoted message is a separate user action without a race window.
         draftLocal = ""
+        draftStore.clear()
         vm.draft = ""
         // 2026-05-07 macCatalyst SwiftUI TextField axis:.vertical 跟 @State binding 同步 race 加 main.async 双重 clear
         DispatchQueue.main.async { self.draftLocal = "" }
