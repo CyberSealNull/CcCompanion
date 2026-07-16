@@ -1496,7 +1496,7 @@ final class ChatViewModel: ObservableObject {
             for (i, delay) in delays.enumerated() {
                 if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
                 guard self?.canCommit(generation: generation, mode: .ccServer) == true else { return }
-                if let text = await networkClient.fetchThinking(turnId: tid) {
+                if let text = await self?.networkClient.fetchThinking(turnId: tid) {
                     guard self?.canCommit(generation: generation, mode: .ccServer) == true else { return }
                     self?.thinkingTurnLoaded(tid, text: text)
                     return
