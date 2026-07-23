@@ -10,7 +10,9 @@ English: [README.en.md](README.en.md)
 
 ✨Find Me✨
 > 微信&测试群：CyberSealNull，备注ccc
+> 
 > TestFlight定向邀请/bug反馈：将你的苹果账户邮箱发送至opia@starryfield.space
+> 
 > 欢迎Bug反馈/PR/新功能许愿
 
 ---
