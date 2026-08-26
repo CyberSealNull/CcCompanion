@@ -3091,8 +3091,8 @@ struct ChatView: View {
             )
             .id(msg.id)
             .padding(.vertical, 4)
-            // v2.2 真机精修(任务3): 微信主题下去掉右侧 12pt 行内边距, 让 user 侧头像与 AI 侧头像两边对称 (各靠 WeChatBubbleRow 内部 12pt). 其它主题保持 12pt 零回归.
-            .padding(.trailing, ThemeStore.shared.theme == .wechat ? 0 : 12)
+            // The user row already owns its horizontal inset; avoid a second right inset.
+            .padding(.trailing, msg.isUser ? 0 : 12)
         }
     }
 
@@ -4796,10 +4796,9 @@ private struct ChatListView: View {
             }
             .id(msg.id)
             .padding(.vertical, 4)
-            // 2026-06-25 T5 修: 微信主题下去掉这层右侧 12pt 行内边距, 否则 user 头像 = WeChatBubbleRow 内部 12pt + 这层 12pt = 距右边缘 24pt,
-            // 比 AI 头像距左边缘 12pt 宽了一倍 (用户报 "user 头像太宽"). 改成 wechat 走 0, 让两侧各靠 WeChatBubbleRow 内部 12pt 对称; 其它主题保持 12pt 零回归.
-            // (对齐 ChatView.chatRowView 已有的同款门控)
-            .padding(.trailing, ThemeStore.shared.theme == .wechat ? 0 : 12)
+            // The user bubble and compact-theme avatar already own their right inset.
+            // Removing this duplicate inset mirrors the assistant bubble's left edge.
+            .padding(.trailing, msg.isUser ? 0 : 12)
             .transition(.asymmetric(
                 insertion: .opacity.combined(with: .move(edge: .bottom)),
                 removal: .opacity

@@ -49,6 +49,8 @@ require(
     r"modifier\(BubblePopIn\(\s*isFresh: vm\.freshPopInRowIds\.contains\(msg\.id\).*onPlayed: \{ vm\.freshPopInRowIds\.remove\(msg\.id\) \}",
     "each fresh row consumes its pop-in marker after playing",
 )
+if len(re.findall(r"\.padding\(\.trailing, msg\.isUser \? 0 : 12\)", text)) != 2:
+    failures.append("both chat render paths use symmetric outer spacing")
 reject(
     r"withAnimation\s*\([^)]*\)\s*\{[^}]*displayedRowsCache\.append",
     "cache append must stay outside list-level animation",
