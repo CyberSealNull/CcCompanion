@@ -640,6 +640,7 @@ final class ChatViewModel: ObservableObject {
 
     @Published var messages: [ChatMessage] = [] {
         didSet {
+            recomputeAssistantTurnEnds()
             // 仅末尾 append 1 条 + 同 day + < 30min gap → incremental append
             // 其他情况 (中间 mutate / 整体替换 / 跨 day / 大 gap / 搜索态) → 全量 rebuild
             let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -771,9 +772,15 @@ final class ChatViewModel: ObservableObject {
     // All ts in the last turn except the first — passed as extra_replace_ids to server
     var lastAssistantTurnExtraTs: [String] { Array(lastAssistantTurn.dropFirst().map { $0.ts }) }
 
-    // Phase D amendment #18 — every assistant turn-end ts (not just the latest).
-    // A message qualifies if it's a non-user assistant message AND the next non-task/move message is a user message (or end of list).
-    var assistantTurnEndsTs: Set<String> {
+    // Cached because every rendered row queries this set for turn-level actions.
+    // Recomputing it per row turns long histories into quadratic render work.
+    private(set) var assistantTurnEndsTs: Set<String> = []
+
+    // Only rows appended at the live edge enter the one-shot pop-in path.
+    // Historical loads and recycled rows remain static.
+    var freshPopInRowIds: Set<String> = []
+
+    private func recomputeAssistantTurnEnds() {
         var result: Set<String> = []
         let filtered = messages.filter { $0.role != "task" && $0.role != "move" }
         for (i, msg) in filtered.enumerated() {
@@ -781,7 +788,7 @@ final class ChatViewModel: ObservableObject {
             let nextIsUser = (i + 1 < filtered.count) ? filtered[i+1].isUser : true
             if nextIsUser { result.insert(msg.ts) }
         }
-        return result
+        assistantTurnEndsTs = result
     }
 
     /// All assistant messages in the turn ENDING at the given ts (turn-end message).
@@ -1039,8 +1046,10 @@ final class ChatViewModel: ObservableObject {
            lastMsg.id == prev.id {
             displayedRowsCache[lastIdx] = .message(lastMsg, showTime: false)
         }
+        // Mark before publishing the cache append so this row alone can animate.
+        freshPopInRowIds.insert(msg.id)
         // 当前 row 默认 showTime=true (末尾本来就显示时间 后续来更新的 msg 再回填)
-        // 不带任何动画 直接 append 防止跟 scroll bottom 撞抖
+        // 不带 list-level 动画直接 append，避免触发布局风暴。
         displayedRowsCache.append(.message(msg, showTime: true))
     }
 
@@ -3041,6 +3050,7 @@ struct ChatView: View {
             ChatMessageListRow(
                 message: msg,
                 showTime: showTime,
+                isLastInGroup: showTime,
                 multiSelectMode: vm.multiSelectMode,
                 selected: vm.selectedTs.contains(msg.ts),
                 onToggleSelection: { vm.toggleSelection(msg) },
@@ -4507,8 +4517,10 @@ private struct ChatListView: View {
                                 .padding(.vertical, 6)
                                 .foregroundStyle(Color.ccTextDim)
                             }
-                            ForEach(vm.displayedRowsCache) { row in
-                                chatRowView(row)
+                            ForEach(Array(vm.displayedRowsCache.enumerated()), id: \.element.id) { index, row in
+                                let previous = index > 0 ? vm.displayedRowsCache[index - 1] : nil
+                                chatRowView(row, pos: groupPos(for: row, previous: previous))
+                                    .padding(.top, chatRowTopSpacing(row, previous: previous))
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
@@ -4700,7 +4712,7 @@ private struct ChatListView: View {
     }
 
     @ViewBuilder
-    private func chatRowView(_ row: ChatRowItem) -> some View {
+    private func chatRowView(_ row: ChatRowItem, pos: BubbleGroupPos) -> some View {
         switch row {
         case .separator(let label, _):
             ChatSeparatorRow(label: label)
@@ -4738,6 +4750,7 @@ private struct ChatListView: View {
                 ChatMessageListRow(
                 message: msg,
                 showTime: showTime,
+                isLastInGroup: showTime,
                 multiSelectMode: vm.multiSelectMode,
                 selected: vm.selectedTs.contains(msg.ts),
                 onToggleSelection: { vm.toggleSelection(msg) },
@@ -4777,7 +4790,8 @@ private struct ChatListView: View {
                 },
                 sendStatus: vm.sendStatus(forId: msg.id),
                 onRetry: msg.isUser ? { vm.retryFailedSend(id: msg.id) } : nil,
-                onDiscardFailed: msg.isUser ? { vm.discardFailedSend(id: msg.id) } : nil
+                onDiscardFailed: msg.isUser ? { vm.discardFailedSend(id: msg.id) } : nil,
+                pos: pos
                 )
             }
             .id(msg.id)
@@ -4790,7 +4804,32 @@ private struct ChatListView: View {
                 insertion: .opacity.combined(with: .move(edge: .bottom)),
                 removal: .opacity
             ))
+            .modifier(BubblePopIn(
+                isFresh: vm.freshPopInRowIds.contains(msg.id),
+                anchor: msg.isUser ? .bottomTrailing : .bottomLeading,
+                onPlayed: { vm.freshPopInRowIds.remove(msg.id) }
+            ))
         }
+    }
+
+    private func groupPos(for row: ChatRowItem, previous: ChatRowItem?) -> BubbleGroupPos {
+        guard case .message(let msg, let showTime) = row else { return .lone }
+        let isFirst: Bool = {
+            guard case .message(let previousMessage, let previousShowTime) = previous else { return true }
+            return !(previousMessage.role == msg.role && previousShowTime == false)
+        }()
+        switch (isFirst, showTime) {
+        case (true, true):   return .lone
+        case (true, false):  return .top
+        case (false, false): return .middle
+        case (false, true):  return .bottom
+        }
+    }
+
+    private func chatRowTopSpacing(_ row: ChatRowItem, previous: ChatRowItem?) -> CGFloat {
+        guard case .message(let msg, _) = row else { return 0 }
+        guard case .message(let previousMessage, let previousShowTime) = previous else { return 0 }
+        return previousMessage.role == msg.role && previousShowTime == false ? 2 : 11
     }
 
     private func handleInputFocusChange(focused: Bool, proxy: ScrollViewProxy) {
@@ -5312,6 +5351,7 @@ private struct PatShakeEffect: GeometryEffect {
 private struct WeChatBubbleRow: View {
     let message: ChatMessage
     let showTime: Bool
+    let isLastInGroup: Bool
     var onImageTap: ((URL) -> Void)? = nil
     var quoteDisplayText: String? = nil
     // 5需求5 (2026-06-25): 引用块点击跳原消息. 闭包由上层 (有 vm 处) 注入.
@@ -5494,10 +5534,12 @@ private struct WeChatBubbleRow: View {
                     .fill(isUser ? Color.ccUser : Color.ccAssistant)
             )
             .overlay(alignment: isUser ? .topTrailing : .topLeading) {
-                WeChatTailTriangle(pointingRight: isUser)
-                    .fill(isUser ? Color.ccUser : Color.ccAssistant)
-                    .frame(width: 6, height: 10)
-                    .offset(x: isUser ? 5 : -5, y: 11)
+                if isLastInGroup {
+                    WeChatTailTriangle(pointingRight: isUser)
+                        .fill(isUser ? Color.ccUser : Color.ccAssistant)
+                        .frame(width: 6, height: 10)
+                        .offset(x: isUser ? 5 : -5, y: 11)
+                }
             }
     }
 
@@ -5556,6 +5598,7 @@ private struct WeChatBubbleRow: View {
 private struct ChatMessageListRow: View {
     let message: ChatMessage
     let showTime: Bool
+    let isLastInGroup: Bool
     let multiSelectMode: Bool
     let selected: Bool
     let onToggleSelection: () -> Void
@@ -5579,6 +5622,7 @@ private struct ChatMessageListRow: View {
     var sendStatus: SendStatus = .sent
     var onRetry: (() -> Void)? = nil
     var onDiscardFailed: (() -> Void)? = nil
+    var pos: BubbleGroupPos = .lone
 
     var body: some View {
         if ThemeStore.shared.theme == .wechat {
@@ -5600,7 +5644,7 @@ private struct ChatMessageListRow: View {
                     .padding(.leading, 12)
             }
             // v2.2 任务7: 微信主题别砍长按菜单, 把跟其它主题一致的长按气泡菜单原样挂到伪装行上.
-            WeChatBubbleRow(message: message, showTime: showTime, onImageTap: onImageTap, quoteDisplayText: quoteDisplayText, onQuoteTap: onQuoteTap)
+            WeChatBubbleRow(message: message, showTime: showTime, isLastInGroup: isLastInGroup, onImageTap: onImageTap, quoteDisplayText: quoteDisplayText, onQuoteTap: onQuoteTap)
         }
         #if !targetEnvironment(macCatalyst)
         .contentShape(Rectangle())
@@ -5671,6 +5715,7 @@ private struct ChatMessageListRow: View {
             ChatBubble(
                 message: message,
                 showTime: showTime,
+                pos: pos,
                 onChoiceSelect: onChoiceSelect,
                 onPreviewActiveChanged: onPreviewActiveChanged,
                 onImageTap: onImageTap,
@@ -6395,6 +6440,7 @@ struct SelectedChatRenderer: View {
 struct ChatBubble: View {
     let message: ChatMessage
     var showTime: Bool = true
+    var pos: BubbleGroupPos = .lone
     var onChoiceSelect: ((String) -> Void)? = nil
     var onPreviewActiveChanged: ((Bool) -> Void)? = nil
     var onImageTap: ((URL) -> Void)? = nil  // 2026-05-07 用户 push 图片点击全屏 zoom 预览
@@ -6412,6 +6458,20 @@ struct ChatBubble: View {
     @State private var isDownloadingPreview: Bool = false
     // Phase 设置大砍 (item B) — observe favorite cache so bookmark icon flips state on tap
     @ObservedObject private var favoritedCache = FavoritedTurnsCache.shared
+
+    private var bubbleFillColor: Color {
+        message.isUser ? Color.ccUser : Color.ccAssistant
+    }
+
+    private var bubbleShapeBackground: some View {
+        ChatBubbleShape(
+            isUser: message.isUser,
+            pos: pos,
+            tailEnabled: ThemeStore.shared.theme != .terminal
+        )
+        .fill(bubbleFillColor)
+        .allowsHitTesting(false)
+    }
 
     var body: some View {
         Group {
@@ -6567,9 +6627,9 @@ struct ChatBubble: View {
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
-                    .background(message.isUser ? Color.ccUser : Color.ccAssistant)
                     .foregroundStyle(message.isUser ? Color.ccUserText : Color.ccAssistantText)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .background(bubbleShapeBackground)
+                    .contentShape(RoundedRectangle(cornerRadius: 17, style: .continuous))
                 }
                 if let loc = message.location {
                     Button {
@@ -6822,6 +6882,119 @@ struct ChatBubble: View {
             print("[ChatBubble] download fail: \(error)")
             return nil
         }
+    }
+}
+
+// One-shot render transform for rows appended at the live edge. It does not
+// animate the lazy stack's layout, and recycled/history rows start settled.
+private struct BubblePopIn: ViewModifier {
+    let isFresh: Bool
+    let anchor: UnitPoint
+    let onPlayed: () -> Void
+    @State private var appeared: Bool
+
+    init(isFresh: Bool, anchor: UnitPoint, onPlayed: @escaping () -> Void) {
+        self.isFresh = isFresh
+        self.anchor = anchor
+        self.onPlayed = onPlayed
+        _appeared = State(initialValue: !isFresh)
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(appeared ? 1 : 0.92, anchor: anchor)
+            .opacity(appeared ? 1 : 0)
+            .onAppear {
+                guard isFresh, !appeared else { return }
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.7)) {
+                    appeared = true
+                }
+                onPlayed()
+            }
+    }
+}
+
+enum BubbleGroupPos { case lone, top, middle, bottom }
+
+// A single path provides layered corner radii and a fused tail. Only lone and
+// bottom bubbles receive a tail, so consecutive messages read as one group.
+private struct ChatBubbleShape: Shape {
+    let isUser: Bool
+    let pos: BubbleGroupPos
+    var tailEnabled: Bool = true
+    var largeRadius: CGFloat = 17
+    var smallRadius: CGFloat = 6
+    var tailReach: CGFloat = 7
+
+    func path(in rect: CGRect) -> Path {
+        let x0 = rect.minX, y0 = rect.minY, x1 = rect.maxX, y1 = rect.maxY
+        let r = largeRadius, s = smallRadius
+        let hasAbove: Bool, hasBelow: Bool, isTailPosition: Bool
+        switch pos {
+        case .lone:   (hasAbove, hasBelow, isTailPosition) = (false, false, true)
+        case .top:    (hasAbove, hasBelow, isTailPosition) = (false, true, false)
+        case .middle: (hasAbove, hasBelow, isTailPosition) = (true, true, false)
+        case .bottom: (hasAbove, hasBelow, isTailPosition) = (true, false, true)
+        }
+        let hasTail = tailEnabled && isTailPosition
+
+        var topLeft = r, topRight = r, bottomRight = r, bottomLeft = r
+        if isUser {
+            topRight = hasAbove ? s : r
+            bottomRight = hasBelow ? s : r
+        } else {
+            topLeft = hasAbove ? s : r
+            bottomLeft = hasBelow ? s : r
+        }
+
+        var path = Path()
+        path.move(to: CGPoint(x: x0 + topLeft, y: y0))
+        path.addLine(to: CGPoint(x: x1 - topRight, y: y0))
+        path.addQuadCurve(
+            to: CGPoint(x: x1, y: y0 + topRight),
+            control: CGPoint(x: x1, y: y0)
+        )
+        if isUser && hasTail {
+            path.addLine(to: CGPoint(x: x1, y: y1 - 9))
+            path.addQuadCurve(
+                to: CGPoint(x: x1 + tailReach, y: y1 - 1),
+                control: CGPoint(x: x1 + 1, y: y1 - 3)
+            )
+            path.addQuadCurve(
+                to: CGPoint(x: x1 - 5, y: y1),
+                control: CGPoint(x: x1 + 2, y: y1 + 1)
+            )
+        } else {
+            path.addLine(to: CGPoint(x: x1, y: y1 - bottomRight))
+            path.addQuadCurve(
+                to: CGPoint(x: x1 - bottomRight, y: y1),
+                control: CGPoint(x: x1, y: y1)
+            )
+        }
+        if !isUser && hasTail {
+            path.addLine(to: CGPoint(x: x0 + 5, y: y1))
+            path.addQuadCurve(
+                to: CGPoint(x: x0 - tailReach, y: y1 - 1),
+                control: CGPoint(x: x0 - 2, y: y1 + 1)
+            )
+            path.addQuadCurve(
+                to: CGPoint(x: x0, y: y1 - 9),
+                control: CGPoint(x: x0 - 1, y: y1 - 3)
+            )
+        } else {
+            path.addLine(to: CGPoint(x: x0 + bottomLeft, y: y1))
+            path.addQuadCurve(
+                to: CGPoint(x: x0, y: y1 - bottomLeft),
+                control: CGPoint(x: x0, y: y1)
+            )
+        }
+        path.addLine(to: CGPoint(x: x0, y: y0 + topLeft))
+        path.addQuadCurve(
+            to: CGPoint(x: x0 + topLeft, y: y0),
+            control: CGPoint(x: x0, y: y0)
+        )
+        path.closeSubpath()
+        return path
     }
 }
 
