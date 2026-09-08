@@ -70,14 +70,27 @@ nonisolated public enum CcServerConfig {
         return Bundle.main.infoDictionary?["CC_PUSH_SECRET"] as? String
     }
 
-    public static func setSharedSecret(_ secret: String?) {
+    /// 返回值 = 这次写入(或清除)是否真的落进 Keychain。
+    /// 2026-09-08: 旧版丢掉 SecItemAdd/SecItemUpdate 的 OSStatus, 写失败跟写成功在调用方眼里
+    /// 一模一样, 于是"向导跑完了"可以在密钥根本没落盘的情况下成立, 用户之后永久 401。
+    /// 调用方必须看返回值, 失败要当场告诉用户, 不许静默放行。
+    @discardableResult
+    public static func setSharedSecret(_ secret: String?) -> Bool {
         let trimmed = (secret ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let ok: Bool
         if trimmed.isEmpty {
-            deleteKeychainSharedSecret()
+            ok = deleteKeychainSharedSecret()
         } else {
-            setKeychainSharedSecret(trimmed)
+            ok = setKeychainSharedSecret(trimmed)
         }
         UserDefaults(suiteName: appGroup)?.removeObject(forKey: kLegacySharedSecret)
+        return ok
+    }
+
+    /// 密钥当前是否可用。向导闸与设置页横幅都读这一个点, 不各自判断。
+    public static var hasSharedSecret: Bool {
+        guard let s = sharedSecret else { return false }
+        return !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     public static func authenticatedRequest(url: URL, method: String = "GET") -> URLRequest {
@@ -167,22 +180,26 @@ nonisolated public enum CcServerConfig {
         return secret
     }
 
-    private static func setKeychainSharedSecret(_ secret: String) {
+    @discardableResult
+    private static func setKeychainSharedSecret(_ secret: String) -> Bool {
         let data = Data(secret.utf8)
         let attrs: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
         let status = SecItemUpdate(keychainQuery() as CFDictionary, attrs as CFDictionary)
-        if status == errSecItemNotFound {
-            var query = keychainQuery()
-            query[kSecValueData as String] = data
-            query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            SecItemAdd(query as CFDictionary, nil)
-        }
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
+        var query = keychainQuery()
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
     }
 
-    private static func deleteKeychainSharedSecret() {
-        SecItemDelete(keychainQuery() as CFDictionary)
+    @discardableResult
+    private static func deleteKeychainSharedSecret() -> Bool {
+        let status = SecItemDelete(keychainQuery() as CFDictionary)
+        // 本来就不存在也算清干净了。
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }

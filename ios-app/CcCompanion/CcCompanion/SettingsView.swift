@@ -588,6 +588,11 @@ struct CcSettingsView: View {
     @ObservedObject private var resolver = EndpointResolver.shared
     @State private var editingEndpoint: EndpointEdit? = nil
     @State private var endpointsTick: Int = 0  // bump to force section re-render after persist
+    // 2026-09-08 用户故障 P0：密钥原来只有 onboarding 向导一个入口，一旦没写进钥匙串
+    // 就再没有任何界面能补填，用户只能永久 401。这里给一个可随时改写的补填入口。
+    @State private var authSecretInput: String = ""
+    @State private var authSecretNote: String = ""
+    @State private var authSecretNoteIsError: Bool = false
 
     // Phase E (item 5) — 头像 PHPicker + crop state
     private enum AvatarSlot { case ai, user }
@@ -1614,6 +1619,61 @@ struct CcSettingsView: View {
 
     // MARK: - Phase multi-server fallback (2026-05-11)
 
+    /// 鉴权密钥补填入口（2026-09-08 用户故障 P0）。
+    /// 只显示「已设置/未设置」不回显原文；写入走 Keychain 并**看返回值**，
+    /// 写失败当场红字告诉用户，不再静默放行。
+    @ViewBuilder
+    private var authSecretRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("鉴权密钥")
+                    .font(.ccSerifAdaptive(size: 15))
+                    .foregroundStyle(Color.ccText)
+                Spacer()
+                Text(CcServerConfig.hasSharedSecret ? "已设置" : "未设置")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(CcServerConfig.hasSharedSecret ? Color.ccTextDim : .red)
+            }
+            Text("server 端 config.toml 里的 shared_secret。全部请求 401 时先来这里补填。")
+                .font(.ccSerifAdaptive(size: 12))
+                .foregroundStyle(Color.ccTextDim)
+            HStack(spacing: 10) {
+                SecureField("粘贴 shared_secret", text: $authSecretInput)
+                    .textFieldStyle(.plain)
+                    .font(.system(.callout, design: .monospaced))
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                Button("保存") {
+                    let trimmed = authSecretInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else {
+                        authSecretNoteIsError = true
+                        authSecretNote = "先粘贴密钥再保存。"
+                        return
+                    }
+                    if CcServerConfig.setSharedSecret(trimmed) {
+                        authSecretInput = ""
+                        authSecretNoteIsError = false
+                        authSecretNote = "已保存到钥匙串。"
+                    } else {
+                        authSecretNoteIsError = true
+                        authSecretNote = "没能写进钥匙串。请解锁设备后重试；仍失败请反馈。"
+                    }
+                    endpointsTick &+= 1
+                }
+                .font(.ccSerifAdaptive(size: 14, weight: .semibold))
+                .foregroundStyle(Color.ccAccent)
+            }
+            if !authSecretNote.isEmpty {
+                Text(authSecretNote)
+                    .font(.ccSerifAdaptive(size: 12))
+                    .foregroundStyle(authSecretNoteIsError ? .red : Color.ccTextDim)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .overlay(Rectangle().fill(Color.ccTextDim.opacity(0.1)).frame(height: 0.5), alignment: .bottom)
+    }
+
     @ViewBuilder
     private var serverEndpointsSection: some View {
         section("SERVER") {
@@ -1647,6 +1707,8 @@ struct CcSettingsView: View {
             actionRow(label: "重新探测全部 (ping /health)", color: .blue) {
                 Task { await resolver.resolveOnce(); endpointsTick &+= 1 }
             }
+
+            authSecretRow
         }
         .id("endpoints-\(endpointsTick)-\(resolver.activeIndex)")
     }

@@ -276,12 +276,10 @@ struct OnboardingWizard: View {
                 // Phase A — connection 成功后顺接 AI identity setup, 不直接完成
                 actionButton(label: "下一步, 设置 AI 身份") {
                     // Persist server URL + secret here (跟 phase 2.2 之前的 completeOnboarding 同 logic, 但 onboardingCompleted 不翻直到最后)
-                    if let url = URL(string: serverURLInput),
-                       let defaults = UserDefaults(suiteName: CcServerConfig.appGroup) {
-                        defaults.set(url.absoluteString, forKey: "serverURL")
-                        if !sharedSecretInput.isEmpty {
-                            CcServerConfig.setSharedSecret(sharedSecretInput)
-                        }
+                    guard persistServerAndSecret() else {
+                        connectionStatus = .failed
+                        connectionError = "密钥没能存进钥匙串，请重试一次。若反复失败，请解锁设备后重开 app 再试。"
+                        return
                     }
                     withAnimation { step = 5 }
                 }
@@ -373,15 +371,32 @@ struct OnboardingWizard: View {
         }
     }
 
-    private func completeOnboarding() {
-        // Phase A — server URL + secret already persisted at step 3 → 4 transition.
-        // Idempotent re-write here as belt-and-suspenders in case user backed up.
+
+    /// 2026-09-08 用户故障 P0：原来 server URL 与密钥共用一个 `if let url = ...` 守卫，
+    /// 且密钥写入的成败被丢掉。任一环节静默失败, 向导照样往下走并翻 onboardingCompleted,
+    /// 于是留下「已配置但没密钥」的死局(永久 401 且没有任何界面能补填)。
+    /// 现在两件事各判各的, 密钥写不进去就返回 false, 由调用方拦住不许完成。
+    @discardableResult
+    private func persistServerAndSecret() -> Bool {
         if let url = URL(string: serverURLInput),
            let defaults = UserDefaults(suiteName: CcServerConfig.appGroup) {
             defaults.set(url.absoluteString, forKey: "serverURL")
-            if !sharedSecretInput.isEmpty {
-                CcServerConfig.setSharedSecret(sharedSecretInput)
-            }
+        }
+        guard !sharedSecretInput.isEmpty else { return true }
+        return CcServerConfig.setSharedSecret(sharedSecretInput)
+    }
+
+    private func completeOnboarding() {
+        // Phase A — server URL + secret already persisted at step 3 → 4 transition.
+        // Idempotent re-write here as belt-and-suspenders in case user backed up.
+        persistServerAndSecret()
+        // 2026-09-08 P0：只有确实拿得到密钥才认「配置完成」。拿不到就退回密钥步，
+        // 而不是翻标志把用户关进「已配置但永久 401」的死局。门 B(直连)不吃这条闸。
+        if !CcServerConfig.hasSharedSecret {
+            connectionStatus = .failed
+            connectionError = "密钥没能存进钥匙串，请重新输入一次。"
+            withAnimation { step = 3 }
+            return
         }
         onboardingCompleted = true
         dismiss()

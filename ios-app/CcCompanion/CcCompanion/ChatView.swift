@@ -634,6 +634,34 @@ enum ChatRowItem: Identifiable, Hashable {
     }()
 }
 
+/// 2026-09-08 用户故障 P2：思考卡片切到终端再切回来会全部消失。
+/// 根因是 ContentView 用 `switch selectedTab` 条件构建各 tab，切走时 ChatView 整个被销毁，
+/// 它持有的 `@StateObject ChatViewModel` 跟着析构；消息本身能回来是因为落了 GRDB，
+/// 而 thinking 文本按设计不进 GRDB(只在 envelope 里)，于是随 VM 一起没了。
+/// 这里给 thinking 一个进程内的存活位置，VM 重建时把已经拉到的重新灌回去。
+/// 只在内存里，不落盘：thinking 不该持久化的原设计不变，重启即清。
+@MainActor
+enum ThinkingMemoryCache {
+    private static var storage: [String: String] = [:]
+    private static var order: [String] = []
+    private static let maxEntries = 500
+
+    static func put(_ tid: String, _ text: String) {
+        if storage[tid] == nil { order.append(tid) }
+        storage[tid] = text
+        while order.count > maxEntries {
+            let dropped = order.removeFirst()
+            storage.removeValue(forKey: dropped)
+        }
+    }
+
+    static var all: [String: String] { storage }
+
+    static func markFetched(_ tid: String) { fetched.insert(tid) }
+    static var fetchedTurns: Set<String> { fetched }
+    private static var fetched: Set<String> = []
+}
+
 @MainActor
 final class ChatViewModel: ObservableObject {
     static let pollingAssistantNotificationIdentifierPrefix = "polling-assistant-"
@@ -727,6 +755,10 @@ final class ChatViewModel: ObservableObject {
     private var thinkingPushObserver: NSObjectProtocol?
 
     init() {
+        // P2：VM 是 @StateObject，切 tab 会被销毁重建。把本进程已经拉到的 thinking
+        // 灌回来，卡片就不会在「终端 → 聊天」来回一趟之后集体消失，也免得重复拉一遍。
+        thinkingByTurn = ThinkingMemoryCache.all
+        thinkingFetchedTurns = ThinkingMemoryCache.fetchedTurns
         thinkingPushObserver = NotificationCenter.default.addObserver(
             forName: .ccThinkingPending, object: nil, queue: .main
         ) { [weak self] note in
@@ -1255,6 +1287,9 @@ final class ChatViewModel: ObservableObject {
     // 拉到非空 thinking → 卡片原地替占位; 重置「无管道」判定.
     @MainActor private func thinkingTurnLoaded(_ tid: String, text: String) {
         thinkingByTurn[tid] = text
+        // P2：同时存进进程级缓存，切 tab 把 VM 拆了也还在。
+        ThinkingMemoryCache.put(tid, text)
+        ThinkingMemoryCache.markFetched(tid)
         thinkingFetchedTurns.insert(tid)
         thinkingInFlightTurns.remove(tid)
         thinkingPlaceholderSince.removeValue(forKey: tid)
@@ -3960,8 +3995,12 @@ private struct ChatInputBar: View {
     }
 
     private func commit() {
-        let rawText = draftLocal.isEmpty ? vm.draft : draftLocal
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 2026-09-08 用户故障 P1：原来这里写 `draftLocal.isEmpty ? vm.draft : draftLocal`,
+        // 把 vm.draft 当输入框空时的后备来源。可是输入框绑的是 draftLocal，
+        // vm.draft 里的残留内容在界面上完全看不见(用户只看到灰色 placeholder),
+        // 下一次发送却会被当成正文发出去——用户报的「灰色预选字被粘上去」就是这个。
+        // 现在只认输入框里真实可见的那份，看得见什么就发什么。
+        let text = draftLocal.trimmingCharacters(in: .whitespacesAndNewlines)
         if !imagePreviews.isEmpty {
             let previews = imagePreviews
             imagePreviews = []
@@ -3969,6 +4008,9 @@ private struct ChatInputBar: View {
             let quotedShared = vm.quoting?.ts
             vm.quoting = nil
             draftLocal = ""
+            // 同一个病根的另一半：图片分支只清了 draftLocal，vm.draft 留着上一次的
+            // caption，下次发送就把它翻出来。两份一起清。
+            vm.draft = ""
             Task {
                 for (idx, preview) in previews.enumerated() {
                     await vm.upload(
